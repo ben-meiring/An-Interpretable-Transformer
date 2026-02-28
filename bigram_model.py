@@ -1,7 +1,10 @@
 import numpy as np
+import time
 import torch
+import math
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.neighbors import NearestNeighbors
 import matplotlib.pyplot as plt
 from matplotlib import animation
 from mpl_toolkits.mplot3d import Axes3D  # required for 3D plotting backend
@@ -9,16 +12,31 @@ from mpl_toolkits.mplot3d import Axes3D  # required for 3D plotting backend
 torch.manual_seed(0)
 np.random.seed(0)
 torch.set_default_dtype(torch.float64)
+start_time = time.time()
 
 # -----------------------------
 # Utilities: true generator + sampling
 # -----------------------------
+
+def fibonacci_sphere(V):
+    indices = torch.arange(0, V, dtype=torch.get_default_dtype()) + 0.5
+    phi = torch.acos(1 - 2*indices/V)
+    theta = torch.pi * (1 + 5**0.5) * indices
+
+    x = torch.cos(theta) * torch.sin(phi)
+    y = torch.sin(theta) * torch.sin(phi)
+    z = torch.cos(phi)
+    return torch.stack([x, y, z], dim=1)
+
 def make_true_P_from_embeddings(V=20, dim=3, beta=1.0):
     E_true = torch.randn(V, dim)
     E_true = E_true / (E_true.norm(dim=1, keepdim=True) + 1e-12)
-    W_true = torch.tensor([[1.0, 0., 0.0],
+    
+    #E_true = fibonacci_sphere(V)
+    
+    W_true = torch.tensor([[2.0, 0., 3.0],
                   [0.0,  1.0, 0.0],
-                  [0.0, 0.0, 1.0]], dtype=torch.float64)
+                  [-3.0, 0.0, 1.0]], dtype=torch.float64)
     logits = beta * (E_true @ W_true @ E_true.t())
     logits = logits - logits.max(dim=1, keepdim=True)[0]
     P = torch.exp(logits)
@@ -142,17 +160,8 @@ class PosAttn_TokenOut(nn.Module):
         B, L = x.shape
         Epart = self.E(x)  # (B,L,dE)
         Ppart = self.Ppos.unsqueeze(0).expand(B, L, 2)  # (B,L,2)
-        # normalize position vectors per-position so ||p_i|| == 1 before concat
-        Ppart = Ppart #/ (Ppart.norm(dim=-1, keepdim=True).clamp_min(1e-12))
-        Epart = Epart #/ (Epart.norm(dim=-1, keepdim=True).clamp_min(1e-12))
-
-
-        if not self.normalize_s:
-            return Epart, Ppart
-
-        s = torch.cat([Epart, Ppart], dim=-1)  # (B,L,dE+2)
-        s = s #/ s.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-        return s[..., : self.dE], s[..., self.dE :]
+        # Return raw embeddings and positions (no normalization here).
+        return Epart, Ppart
 
     def attn_weights(self):
         L = self.L
@@ -163,7 +172,6 @@ class PosAttn_TokenOut(nn.Module):
         Ppart = self.Ppos  # (L,2)
         s = torch.cat([E_dummy, Ppart], dim=1)  # (L, dE+2)
 
-        #s = s / (s.norm(dim=-1, keepdim=True).clamp_min(1e-12))
 
         # Build block metric: zeros except for lower-right 2x2 block
         M_block = torch.zeros(dE + 2, dE + 2, dtype=self.Mp.dtype, device=self.Mp.device)
@@ -208,10 +216,8 @@ class PosAttn_TokenOut(nn.Module):
 @torch.no_grad()
 def implied_bigram_Phat_forwardlike(model):
     E = model.E.weight  # (V,dE) raw
-    denom = (E.pow(2).sum(dim=1, keepdim=True) + 1.0).sqrt().clamp_min(1e-12)
-    Eeff = E / denom  # matches normalize_s=True with ||p||=1
-
-    logits = model.tau * (Eeff @ model.WE @ E.t())  # (V,V)
+    # Use raw embeddings (no normalization) to form implied logits
+    logits = model.tau * (E @ model.WE @ E.t())  # (V,V)
     logits = logits - logits.max(dim=1, keepdim=True)[0]
     P_hat = torch.softmax(logits, dim=1)
     return P_hat
@@ -242,7 +248,7 @@ def alpha_diagnostics(model):
     return float(torch.stack(mass_prev).mean().item()), float(torch.stack(max_comp).mean().item())
 
 # -----------------------------
-# Main experiment
+# main experiment
 # -----------------------------
 def run(
     disorder_mode="none",
@@ -250,11 +256,11 @@ def run(
     dE=3,
     n_seqs=20000,
     seq_len=8,
-    steps=501,
-    lr=3e-3,
-    batch_size=100,
+    n_epochs=400,
+    lr=5e-3,
+    batch_size=300,
     true_beta=1.0,
-    whiten_positions=True,  # <--- Add this flag
+    whiten_positions=False,  # <--- Add this flag
 ):
     E_true, P_true, W_true = make_true_P_from_embeddings(V=V, dim=dE, beta=true_beta)
     seqs = sample_markov_sequences(P_true, n_seqs=n_seqs, seq_len=seq_len)
@@ -265,65 +271,154 @@ def run(
 
     model = PosAttn_TokenOut(V=V, L=seq_len, dE=dE, normalize_s=True)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    initial_patience = 800
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', patience=initial_patience, threshold=1e-3, min_lr=1e-6, factor=0.5)
 
     # snapshots recorded for animation
     pos_snapshots = []
     E_snapshots = []
     alpha_snapshots = []
+    D_abs_snapshots = []
     # Mp_snapshots = []  # <-- Add this line
     # WE_snapshots = []
     snapshot_steps = []
 
     l2_lambda = 1e-4  # You can adjust this value
+    l_target = true_beta * (E_true @ W_true @ E_true.t())
 
-    for step in range(steps):
-        idx = torch.randint(0, n_seqs, (batch_size,))
-        x = seqs_data[idx]
+    #n_epochs = 10  # Set as needed
+    #batch_size = 100
+    n_seqs = seqs_data.shape[0]
+    batch_counter = 0
 
-        logits = model(x)        # (bs,L-1,V)
-        targets = x[:, 1:]
-        loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1))
-
-        p_norms = model.Ppos.norm(dim=1)
-        E_norms = model.E.weight.norm(dim=1)
-        radius_penalty = ((p_norms - 1.0) ** 2).mean() + ((E_norms - 1.0) ** 2).mean()
+    for epoch in range(n_epochs):
+        perm = torch.randperm(n_seqs)
         
-        #loss = loss + l2_lambda * radius_penalty
+        for i in range(0, n_seqs, batch_size):
+            idx = perm[i:i+batch_size]
+            x = seqs_data[idx]
+            # --- training step ---
+            logits = model(x)
+            targets = x[:, 1:]
+            loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1))
 
-        opt.zero_grad()
-        loss.backward()
-        # optional: clip to be extra safe
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        opt.step()
+            p_norms = model.Ppos.norm(dim=1)
+            E_norms = model.E.weight.norm(dim=1)
+            # radius_penalty = ((p_norms - 1.0) ** 2).mean() + ((E_norms - 1.0) ** 2).mean()
 
-        if step % 300 == 0 or step == steps - 1:
-            avg_prev, avg_comp = alpha_diagnostics(model)
-            print(
-                f"Step {step:4d} | loss {loss.item():.6f} | "
-                f"alpha[i,i-1] mean {avg_prev:.3f} | max competitor mean {avg_comp:.3f} | "
-                f"beta_attn {float(model.beta_attn.item()):.3f} | tau {float(model.tau.item()):.3f}"
-            )
-            # Print average embedding and position norms
-            avg_E = model.E.weight.norm(dim=1).mean().item()
-            avg_p = model.Ppos.data.norm(dim=1).mean().item()
+            opt.zero_grad()
+            loss.backward()
+            #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            opt.step()
 
-            # Compute mean |s| (concatenated and normalized vector)
-            with torch.no_grad():
-                Epart, Ppart = model._parts(x)
-                s = torch.cat([Epart, Ppart], dim=-1)
-                mean_s = s.norm(dim=-1).mean().item()
+            if (batch_counter % (100 * math.ceil(n_seqs / batch_size)) == 0) or (epoch == n_epochs - 1 and i + batch_size >= n_seqs):
+                #if step % 1000 == 0 or step == steps - 1:
+                avg_prev, avg_comp = alpha_diagnostics(model)
+                print(
+                    f"epoch {(epoch):4d} | loss {loss.item():.6f} | "
+                    f"alpha[i,i-1] mean {avg_prev:.3f} | max competitor mean {avg_comp:.3f} | "
+                    f"beta_attn {float(model.beta_attn.item()):.3f} | tau {float(model.tau.item()):.3f} | "
+                    f"learning rate : {opt.param_groups[0]['lr']:.2e} | batch_size : {batch_size} | "
+                    f"patience : {scheduler.patience} | "
+                    f"Elapsed time: {time.time() - start_time:.2f} seconds. " 
+                )
+                # Print average embedding and position norms
+                avg_E = model.E.weight.norm(dim=1).mean().item()
+                avg_p = model.Ppos.data.norm(dim=1).mean().item()
 
-            print(f"Mean |E|: {avg_E:.4f} | Mean |p|: {avg_p:.4f} | Mean |s|: {mean_s:.4f}")
-        # record snapshots for animation (positions and entire embedding table)
-        try:
-            pos_snapshots.append(model.Ppos.detach().cpu().numpy().copy())  # (L,2)
-            E_snapshots.append(model.E.weight.detach().cpu().numpy().copy())  # (V,dE)
-            alpha_snapshots.append(model.attn_weights().detach().cpu().numpy().copy())  # (L,L)
-            # Mp_snapshots.append(model.Mp.detach().cpu().numpy().copy())  # <-- Add this line
-            # WE_snapshots.append(model.Mp.detach().cpu().numpy().copy())  # <-- Add this line
-            snapshot_steps.append(step)
-        except Exception:
-            pass
+                # Compute mean |s| (concatenated and normalized vector)
+                with torch.no_grad():
+                    Epart, Ppart = model._parts(x)
+                    s = torch.cat([Epart, Ppart], dim=-1)
+                    mean_s = s.norm(dim=-1).mean().item()
+
+                print(f"Mean |E|: {avg_E:.4f} | Mean |p|: {avg_p:.4f} | Mean |s|: {mean_s:.4f}")
+            # record snapshots for animation (positions and entire embedding table)
+            try:
+                pos_snapshots.append(model.Ppos.detach().cpu().numpy().copy())  # (L,2)
+                E_snapshots.append(model.E.weight.detach().cpu().numpy().copy())  # (V,dE)
+                alpha_snapshots.append(model.attn_weights().detach().cpu().numpy().copy())  # (L,L)
+                # Mp_snapshots.append(model.Mp.detach().cpu().numpy().copy())  # <-- Add this line
+                # WE_snapshots.append(model.Mp.detach().cpu().numpy().copy())  # <-- Add this line
+
+                E_snapshot = model.E.weight.detach()
+                tau_snapshot = float(model.tau.item())
+                WE_snapshot = model.WE.detach()
+                l_empirical = tau_snapshot * (E_snapshot @ WE_snapshot @ E_snapshot.t())  # (V, V)
+                D_abs = (l_empirical - l_target).abs().cpu().numpy()
+                D_abs_snapshots.append(D_abs)
+
+                snapshot_steps.append(batch_counter)
+                batch_counter += 1
+                #snapshot_steps.append((i // batch_size))
+            except Exception:
+                pass
+
+        scheduler.step(loss)  # Use the last batch's loss or compute average loss for the epoch
+        current_lr = opt.param_groups[0]['lr']
+        scheduler.patience = int(initial_patience * (lr/current_lr))
+
+    end_time = time.time()
+    elapsed = end_time - start_time
+    print(f"\nTotal training time: {elapsed:.2f} seconds ({elapsed/60:.2f} minutes)")
+    # for step in range(steps):
+    #     idx = torch.randint(0, n_seqs, (batch_size,))
+    #     x = seqs_data[idx]
+    #     # print(step)
+
+    #     logits = model(x)        # (bs,L-1,V)
+        
+    #     targets = x[:, 1:]
+    #     loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1))
+
+    #     p_norms = model.Ppos.norm(dim=1)
+    #     E_norms = model.E.weight.norm(dim=1)
+    #     radius_penalty = ((p_norms - 1.0) ** 2).mean() + ((E_norms - 1.0) ** 2).mean()
+        
+    #     #loss = loss + l2_lambda * radius_penalty
+
+    #     opt.zero_grad()
+    #     loss.backward()
+    #     # optional: clip to be extra safe
+    #     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+    #     opt.step()
+
+        # if step % 1000 == 0 or step == steps - 1:
+        #     avg_prev, avg_comp = alpha_diagnostics(model)
+        #     print(
+        #         f"Step {step:4d} | loss {loss.item():.6f} | "
+        #         f"alpha[i,i-1] mean {avg_prev:.3f} | max competitor mean {avg_comp:.3f} | "
+        #         f"beta_attn {float(model.beta_attn.item()):.3f} | tau {float(model.tau.item()):.3f}"
+        #     )
+        #     # Print average embedding and position norms
+        #     avg_E = model.E.weight.norm(dim=1).mean().item()
+        #     avg_p = model.Ppos.data.norm(dim=1).mean().item()
+
+        #     # Compute mean |s| (concatenated and normalized vector)
+        #     with torch.no_grad():
+        #         Epart, Ppart = model._parts(x)
+        #         s = torch.cat([Epart, Ppart], dim=-1)
+        #         mean_s = s.norm(dim=-1).mean().item()
+
+        #     print(f"Mean |E|: {avg_E:.4f} | Mean |p|: {avg_p:.4f} | Mean |s|: {mean_s:.4f}")
+        # # record snapshots for animation (positions and entire embedding table)
+        # try:
+        #     pos_snapshots.append(model.Ppos.detach().cpu().numpy().copy())  # (L,2)
+        #     E_snapshots.append(model.E.weight.detach().cpu().numpy().copy())  # (V,dE)
+        #     alpha_snapshots.append(model.attn_weights().detach().cpu().numpy().copy())  # (L,L)
+        #     # Mp_snapshots.append(model.Mp.detach().cpu().numpy().copy())  # <-- Add this line
+        #     # WE_snapshots.append(model.Mp.detach().cpu().numpy().copy())  # <-- Add this line
+
+        #     E_snapshot = model.E.weight.detach()
+        #     tau_snapshot = float(model.tau.item())
+        #     WE_snapshot = model.WE.detach()
+        #     l_empirical = tau_snapshot * (E_snapshot @ WE_snapshot @ E_snapshot.t())  # (V, V)
+        #     D_abs = (l_empirical - l_target).abs().cpu().numpy()
+        #     D_abs_snapshots.append(D_abs)
+
+        #     snapshot_steps.append(step)
+        # except Exception:
+        #     pass
 
     L_full = full_data_loss(model, seqs_data)
 
@@ -404,13 +499,14 @@ def run(
         # no snapshots recorded (very short run) — use final state
         pos_snapshots = [model.Ppos.detach().cpu().numpy().copy()]
         E_snapshots = [model.E.weight.detach().cpu().numpy().copy()]
-        snapshot_steps = [steps - 1]
+        snapshot_steps = [batch_counter-1]
 
     # Subsample snapshots to every 50th frame for faster animation
-    stride = 50
+    stride = 200
     pos_snapshots = pos_snapshots[::stride]
     E_snapshots = E_snapshots[::stride]
     alpha_snapshots = alpha_snapshots[::stride]
+    D_abs_snapshots = D_abs_snapshots[::stride]
     # Mp_snapshots = Mp_snapshots[::stride]
     # WE_snapshots = WE_snapshots[::stride]
     snapshot_steps = snapshot_steps[::stride]
@@ -456,7 +552,7 @@ def run(
             return (scatter,)
 
         anim_ptilde = animation.FuncAnimation(fig, update_ptilde, init_func=init_ptilde,
-                                              frames=len(ptilde_snapshots), interval=80, blit=True)
+                                              frames=len(ptilde_snapshots), interval=50, blit=True)
         plt.show()
         plt.close(fig)
     except Exception as e:
@@ -480,35 +576,30 @@ def run(
         else:
             U_E = eigvecs_E
 
+        # Subsample tokens for plotting (max 500 tokens)
+        max_tokens = 500
+        V = E_snapshots[0].shape[0]
+        token_idx = np.linspace(0, V-1, min(V, max_tokens), dtype=int)
+        emb_colors_sub = emb_colors[token_idx]
+
         Etilde_snapshots = [E @ U_E for E in E_snapshots]
+        Etilde_snapshots_sub = [E[token_idx] for E in Etilde_snapshots]
 
-        all_Etilde = np.vstack(Etilde_snapshots)
-        mins = all_Etilde.min(axis=0)[:3]
-        maxs = all_Etilde.max(axis=0)[:3]
-        for dim in range(3):
-            rng = maxs[dim] - mins[dim]
-            ax3.set_xlim(mins[0]-0.1*rng, maxs[0]+0.1*rng)
-            ax3.set_ylim(mins[1]-0.1*rng, maxs[1]+0.1*rng)
-            ax3.set_zlim(mins[2]-0.1*rng, maxs[2]+0.1*rng)
-        ax3.set_xlim(-3., 3.)
-        ax3.set_ylim(-3., 3.)
-        ax3.set_zlim(-3., 3.)
-
-        sc = ax3.scatter(Etilde_snapshots[0][:,0], Etilde_snapshots[0][:,1], Etilde_snapshots[0][:,2], s=30, c=emb_colors)
+        sc = ax3.scatter(Etilde_snapshots_sub[0][:,0], Etilde_snapshots_sub[0][:,1], Etilde_snapshots_sub[0][:,2], s=30, c=emb_colors_sub)
         ax3.set_title("")
 
         def update_emb3(i):
-            Ecur = Etilde_snapshots[i]
+            Ecur = Etilde_snapshots_sub[i]
             xs = Ecur[:,0]
             ys = Ecur[:,1]
             zs = Ecur[:,2]
             sc._offsets3d = (xs, ys, zs)
-            sc.set_color(emb_colors)
+            sc.set_color(emb_colors_sub)
             ax3.set_title(f"Transformed Embeddings snapshot step {snapshot_steps[i]}")
             return (sc,)
 
-        anim_emb = animation.FuncAnimation(fig, update_emb3, frames=len(Etilde_snapshots),
-                                           interval=80, blit=False)
+        anim_emb = animation.FuncAnimation(fig, update_emb3, frames=len(Etilde_snapshots_sub),
+                                           interval=50, blit=False)
         plt.show()
         plt.close(fig)
     except Exception as e:
@@ -532,29 +623,160 @@ def run(
             return (im,)
 
         anim_alpha = animation.FuncAnimation(
-            fig, update_alpha, frames=n_frames, interval=80, blit=False
+            fig, update_alpha, frames=n_frames, interval=50, blit=False
         )
         plt.show()
         plt.close(fig)
     except Exception as e:
         print("Could not build/show alpha heatmap animation:", e)
+
+    fig, ax = plt.subplots(figsize=(6,5))
+    eps = 1e-8
+    log_D = np.log10(D_abs_snapshots[0] + eps)
+    im = ax.imshow(log_D, cmap='hot', vmin=log_D.min(), vmax=log_D.max())
+    cbar = plt.colorbar(im, ax=ax)
+    ax.set_title(f"l_ij convergence step {snapshot_steps[0]}")
+
+    final_D = D_abs_snapshots[-1]
+    vmin = final_D.min()
+    vmax = final_D.max()
+
+    im = ax.imshow(D_abs_snapshots[0], cmap='hot', vmin=vmin, vmax=vmax)
+
+    def update_heatmap(i):
+        im.set_data(D_abs_snapshots[i])
+        # Keep vmin/vmax fixed for all frames
+        im.set_clim(vmin, vmax)
+        ax.set_title(f"l_ij convergence step {snapshot_steps[i]}")
+        return (im,)
+
+    anim = animation.FuncAnimation(
+        fig, update_heatmap, frames=len(D_abs_snapshots), interval=80, blit=False
+    )
+    plt.show()
+    plt.close(fig)
     
-    WE_learned = model.WE.detach().cpu().numpy()
+
+    ## some statistics/output
+    WE_final_torch = model.WE.detach().cpu()
     tau = float(model.tau.item())
-    WE_learned_rescaled = tau * WE_learned
 
-    S_learned = 0.5 * (WE_learned_rescaled + WE_learned_rescaled.T)
-    S_true = 0.5 * (W_true + W_true.T)
+    # --- whiten embeddings (global linear whitening, score-preserving) ---
+    with torch.no_grad():
+        
+        ## construct symmetric/anti-symmetric parts
+        S = 0.5 * (WE_final_torch + WE_final_torch.T)
+        K = 0.5 * (WE_final_torch - WE_final_torch.T)
+        #S = WE_final_torch
 
-    print()
-    print(f"S_learned : {S_learned}")
-    print(f"S_true : {S_true}")
-    print()
-    print("Eigenvalues S_learned:", np.sort(np.linalg.eigvalsh(S_learned)))
-    print("Eigenvalues S_true:", np.sort(np.linalg.eigvalsh(S_true)))
-    print()
-    print("Eigenvalues S_learned:", np.sort(np.linalg.eigvalsh(WE_learned_rescaled)))
-    print("Eigenvalues S_true:", np.sort(np.linalg.eigvalsh(W_true)))
+        # 1. Diagonalize S
+        eigvals, U = torch.linalg.eigh(S)  # S = U @ diag(eigvals) @ U.T
+        S_diag = torch.diag(eigvals)  # [dE, dE]
+        K_eig = U.T @ K @ U
+
+
+        # 2. Transform embeddings into S's eigenbasis
+        E = model.E.weight.detach()  # [V, dE]
+        E_prime = E @ U  # shape: [V, dE]
+        Etilde = E_prime / E_prime.norm(dim=1, keepdim=True)  # [V, dE]
+
+
+        # Per-token metric: include both symmetric and antisymmetric parts
+        norms_squared = E_prime.norm(dim=1) ** 2  # [V]
+        Wtilde = tau * torch.stack([S_diag * ns + K_eig for ns in norms_squared])  # [V, dE, dE]
+
+        ## to compute the density of tokens Etilde
+        # Etilde: shape (V, dE), Wtilde: shape (V, dE, dE)
+        V = Etilde.shape[0]
+        k = min(4, V-1)
+
+        # Compute arclength matrix (angle between points)
+        Etilde_np = Etilde.cpu().numpy()
+        dot_products = np.clip(Etilde_np @ Etilde_np.T, -1.0, 1.0)
+        arclength_matrix = np.arccos(dot_products)  # shape (V, V)
+
+        # Find k nearest neighbors for each token (excluding self)
+        nbrs = NearestNeighbors(n_neighbors=k+1, metric='precomputed').fit(arclength_matrix)
+        distances, indices = nbrs.kneighbors(arclength_matrix)
+        mean_arclength = distances[:, 1:].mean(axis=1)  # shape (V,)
+
+        # Density estimate: inverse of mean arclength
+        density = 1.0 / (mean_arclength + 1e-8)
+        density = density / density.sum()
+        weights = 1.0 / (density + 1e-8)
+        weights = weights / weights.sum()  # normalize to sum to 1
+
+
+        # 6. Compute mean and variance
+        mean_Wtilde = Wtilde.mean(dim=0)
+        var_Wtilde = Wtilde.var(dim=0)
+
+        # Weighted mean and variance of Wtilde
+        Wtilde_np = Wtilde.cpu().numpy()
+        mean_Wtilde_weighted = np.tensordot(weights, Wtilde_np, axes=([0],[0]))  # (dE, dE)
+        second_moment = np.tensordot(weights, Wtilde_np**2, axes=([0],[0]))      # (dE, dE)
+        var_Wtilde_weighted = second_moment - mean_Wtilde_weighted**2
+
+        print("\nWeighted Mean Wtilde (uniform-corrected):\n", mean_Wtilde_weighted)
+        print("\nWeighted Variance Wtilde (uniform-corrected):\n", var_Wtilde_weighted)
+
+
+        # print()
+        # print(Etilde)
+        # print()
+        # print(Etilde.norm(dim=1))
+        print()
+        print("Mean Wtilde:\n", mean_Wtilde)
+        print()
+        print("Variance Wtilde:\n", var_Wtilde)
+    
+        print()
+        # E_true: (V, dE) target embeddings (unit norm)
+        # Etilde: (V, dE) empirical embeddings (unit norm, after whitening)
+        # W_true: (dE, dE) (identity)
+        # WE_final_torch: (dE, dE) learned metric
+        # tau: scalar, model.tau.item()
+        # true_beta: scalar, used for target logits
+
+
+        l_target_centered = l_target - l_target.mean(dim=1, keepdim=True)
+        l_empirical_centered = l_empirical - l_empirical.mean(dim=1, keepdim=True)
+        D_centered = l_empirical_centered - l_target_centered
+
+        # Target logits
+        l_target = true_beta * (E_true @ W_true @ E_true.t())
+
+        # Empirical logits
+        l_empirical = tau * (Etilde @ WE_final_torch @ Etilde.t())
+
+        D = l_empirical - l_target
+
+        print("\n--- Target vs. Empirical Logits ---")
+        print("Mean difference:", D.abs().mean().item())
+        print("Median difference:", D.abs().median().item())
+        print("Std difference:", D.abs().std().item())
+        print("Min difference:", D.abs().min().item())
+        print("Max difference:", D.abs().max().item())
+
+        print("\n--- Centered Target vs. Empirical Logits ---")
+        print("Centered Mean difference:", D_centered.abs().mean().item())
+        print("Centered Median difference:", D_centered.abs().median().item())
+        print("Centered Std difference:", D_centered.abs().std().item())
+        print("Centered Min difference:", D_centered.abs().min().item())
+        print("Centered Max difference:", D_centered.abs().max().item())
+
+        print("\n--- Q's ---")
+        print("Mean absolute difference between Q_model and Q_true:", (P_hat_bigram - P_true).abs().mean().item())
+        print(" Median difference:", (P_hat_bigram - P_true).abs().median().item())
+        print(" Std difference:", (P_hat_bigram - P_true).abs().std().item())
+        print(" Min difference:",(P_hat_bigram - P_true).abs().min().item())
+        print(" Max difference:",(P_hat_bigram - P_true).abs().max().item())
+    # --- end whitening ---
+
+
+
+
+
 
 if __name__ == "__main__":
-    run()  # Set to False to just diagonalize
+    run()
