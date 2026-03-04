@@ -14,6 +14,8 @@ np.random.seed(0)
 torch.set_default_dtype(torch.float64)
 start_time = time.time()
 
+
+
 # -----------------------------
 # Utilities: true generator + sampling
 # -----------------------------
@@ -32,13 +34,13 @@ def make_true_P_from_embeddings(V=20, dim=3, beta=1.0):
     E_true = torch.randn(V, dim)
     E_true = E_true / (E_true.norm(dim=1, keepdim=True) + 1e-12)
     
-    #E_true = fibonacci_sphere(V)
+    E_true = fibonacci_sphere(V)
     
-    W_true = torch.tensor([[2.0, 0., 3.0],
-                  [0.0,  1.0, 0.0],
-                  [-3.0, 0.0, 1.0]], dtype=torch.float64)
+    W_true = torch.tensor([[3.0, 0., 1.0],
+                  [0.0,  2.0, 0.0],
+                  [-1.0, 0.0, 1.0]], dtype=torch.float64)
     logits = beta * (E_true @ W_true @ E_true.t())
-    logits = logits - logits.max(dim=1, keepdim=True)[0]
+    logits = logits - logits.max(dim=1, keepdim=True)[0] ## This is where i fix my gauge
     P = torch.exp(logits)
     P = P / (P.sum(dim=1, keepdim=True) + 1e-12)
     return E_true, P, W_true  # <--- Add W_true here
@@ -218,7 +220,9 @@ def implied_bigram_Phat_forwardlike(model):
     E = model.E.weight  # (V,dE) raw
     # Use raw embeddings (no normalization) to form implied logits
     logits = model.tau * (E @ model.WE @ E.t())  # (V,V)
+    #logits = logits - logits.mean(dim=1, keepdim=True)
     logits = logits - logits.max(dim=1, keepdim=True)[0]
+    
     P_hat = torch.softmax(logits, dim=1)
     return P_hat
 
@@ -254,9 +258,9 @@ def run(
     disorder_mode="none",
     V=100,
     dE=3,
-    n_seqs=20000,
+    n_seqs=2*(100**2),
     seq_len=8,
-    n_epochs=400,
+    n_epochs=300,
     lr=5e-3,
     batch_size=300,
     true_beta=1.0,
@@ -271,7 +275,7 @@ def run(
 
     model = PosAttn_TokenOut(V=V, L=seq_len, dE=dE, normalize_s=True)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    initial_patience = 800
+    initial_patience = 500
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', patience=initial_patience, threshold=1e-3, min_lr=1e-6, factor=0.5)
 
     # snapshots recorded for animation
@@ -283,6 +287,7 @@ def run(
     # WE_snapshots = []
     snapshot_steps = []
 
+    print()
     l2_lambda = 1e-4  # You can adjust this value
     l_target = true_beta * (E_true @ W_true @ E_true.t())
 
@@ -311,7 +316,7 @@ def run(
             #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             opt.step()
 
-            if (batch_counter % (100 * math.ceil(n_seqs / batch_size)) == 0) or (epoch == n_epochs - 1 and i + batch_size >= n_seqs):
+            if (batch_counter % (500 * math.ceil(n_seqs / batch_size)) == 0) or (epoch == n_epochs - 1 and i + batch_size >= n_seqs):
                 #if step % 1000 == 0 or step == steps - 1:
                 avg_prev, avg_comp = alpha_diagnostics(model)
                 print(
@@ -663,100 +668,109 @@ def run(
 
     # --- whiten embeddings (global linear whitening, score-preserving) ---
     with torch.no_grad():
-        
-        ## construct symmetric/anti-symmetric parts
+        # Symmetric/antisymmetric decomposition of learned token metric
         S = 0.5 * (WE_final_torch + WE_final_torch.T)
         K = 0.5 * (WE_final_torch - WE_final_torch.T)
-        #S = WE_final_torch
 
-        # 1. Diagonalize S
+        # 1. Diagonalize symmetric part S
         eigvals, U = torch.linalg.eigh(S)  # S = U @ diag(eigvals) @ U.T
-        S_diag = torch.diag(eigvals)  # [dE, dE]
-        K_eig = U.T @ K @ U
-
 
         # 2. Transform embeddings into S's eigenbasis
-        E = model.E.weight.detach()  # [V, dE]
-        E_prime = E @ U  # shape: [V, dE]
+        E = model.E.weight.detach()        # [V, dE]
+        E_prime = E @ U                    # [V, dE]
+        V, dE = E_prime.shape
+
+        # Center embeddings in eigenbasis (used for recovering W)
+        mu_prime = E_prime.mean(dim=0, keepdim=True)      # [1, dE]
+        Eprime_c = E_prime - mu_prime                    # [V, dE]
+
+        # Build centered logit matrix from learned metric
+        S_full = tau * (E @ WE_final_torch @ E.T)        # [V, V]
+        S_tilde = S_full - S_full.mean(dim=1, keepdim=True)  # Row-mean subtraction
+
+        # Recover W in eigenbasis via regularized least squares
+        A = E_prime
+        B = Eprime_c
+        lam = 1e-3
+
+        AtA = A.T @ A
+        BtB = B.T @ B
+        I = torch.eye(dE, device=A.device, dtype=A.dtype)
+
+        M = A.T @ S_tilde @ B
+        X = torch.linalg.solve(AtA + lam * I, M)
+        W_eig_hat = torch.linalg.solve(BtB + lam * I, X.T).T
+        W_eig_hat = W_eig_hat / tau                        # [dE, dE]
+
+        # Map recovered W back to original basis
+        W_hat = U @ W_eig_hat @ U.T                        # [dE, dE]
+        print("\nRecovered W (original basis):\n", W_hat)
+
+        # Build per-token effective metric tensors using recovered W_hat
         Etilde = E_prime / E_prime.norm(dim=1, keepdim=True)  # [V, dE]
+        norms_squared = E_prime.norm(dim=1) ** 2              # [V]
+        Wtilde = tau * torch.stack([W_hat * ns for ns in norms_squared])  # [V, dE, dE]
 
-
-        # Per-token metric: include both symmetric and antisymmetric parts
-        norms_squared = E_prime.norm(dim=1) ** 2  # [V]
-        Wtilde = tau * torch.stack([S_diag * ns + K_eig for ns in norms_squared])  # [V, dE, dE]
-
-        ## to compute the density of tokens Etilde
-        # Etilde: shape (V, dE), Wtilde: shape (V, dE, dE)
-        V = Etilde.shape[0]
-        k = min(4, V-1)
-
-        # Compute arclength matrix (angle between points)
-        Etilde_np = Etilde.cpu().numpy()
-        dot_products = np.clip(Etilde_np @ Etilde_np.T, -1.0, 1.0)
-        arclength_matrix = np.arccos(dot_products)  # shape (V, V)
-
-        # Find k nearest neighbors for each token (excluding self)
-        nbrs = NearestNeighbors(n_neighbors=k+1, metric='precomputed').fit(arclength_matrix)
-        distances, indices = nbrs.kneighbors(arclength_matrix)
-        mean_arclength = distances[:, 1:].mean(axis=1)  # shape (V,)
-
-        # Density estimate: inverse of mean arclength
-        density = 1.0 / (mean_arclength + 1e-8)
-        density = density / density.sum()
-        weights = 1.0 / (density + 1e-8)
-        weights = weights / weights.sum()  # normalize to sum to 1
-
-
-        # 6. Compute mean and variance
         mean_Wtilde = Wtilde.mean(dim=0)
         var_Wtilde = Wtilde.var(dim=0)
 
-        # Weighted mean and variance of Wtilde
-        Wtilde_np = Wtilde.cpu().numpy()
-        mean_Wtilde_weighted = np.tensordot(weights, Wtilde_np, axes=([0],[0]))  # (dE, dE)
-        second_moment = np.tensordot(weights, Wtilde_np**2, axes=([0],[0]))      # (dE, dE)
-        var_Wtilde_weighted = second_moment - mean_Wtilde_weighted**2
+        print("\nMean Wtilde:\n", mean_Wtilde)
+        print("\nVar Wtilde:\n", var_Wtilde)
 
-        print("\nWeighted Mean Wtilde (uniform-corrected):\n", mean_Wtilde_weighted)
-        print("\nWeighted Variance Wtilde (uniform-corrected):\n", var_Wtilde_weighted)
+        ## new thing
+        V, d = E.shape
+        tau_val = float(tau) if not isinstance(tau, float) else tau
+
+        Sigma = (E.T @ E) / E.shape[0]
+        whitelam, whiteU = torch.linalg.eigh(Sigma)
+        whiteA = (whiteU * (1.0 / torch.sqrt(whitelam + 1e-12))) @ whiteU.T
+
+        # print(E.shape[0])
+        # print(Sigma)
+        # print(whiteA @ Sigma @ whiteA.T)
+
+        
+
+        #W_whiten = np.linalg.inv(A).T @ W @ np.linalg.inv(A)
 
 
-        # print()
-        # print(Etilde)
-        # print()
-        # print(Etilde.norm(dim=1))
+        # --- 1) Build gauge-fixed logits S_tilde from empirical params ---
+        S_emp   = tau_val * (E @ WE_final_torch @ E.T )                 # [V, V]
+        S_tilde = S_emp - S_emp.mean(dim=1, keepdim=True)             # row-mean subtraction
+
+        # --- 2) Enforce unit-norm embedding gauge ---
+        eps = 1e-12
+        B = E - E.mean(dim=0, keepdim=True)          # [V, 3]
+
+        E_pinv = torch.linalg.pinv(E)                # [3, V]
+        B_pinv = torch.linalg.pinv(B)                # [3, V]
+
+        W = (E_pinv @ S_tilde @ B_pinv.T) #/ tau_val   # [3, 3]
+        W_whiten = torch.linalg.inv(whiteA).T @ W @ torch.linalg.inv(whiteA)
+        W = 3 * W_whiten
+        # --- 4) Impose "diagonal + antisymmetric" canonical form ---
+        W_sym  = 0.5 * (W + W.T)
+        W_asym = 0.5 * (W - W.T)
+
+        # W_diag = torch.diag(torch.diagonal(W_sym))                    # keep only diagonal of symmetric part
+        # 2) diagonalize symmetric part: W_sym = R @ diag(lam) @ R.T
+        W_diag, R = torch.linalg.eigh(W_sym)          # lam ascending, R orthonormal
+        W_canon = R.T @ W @ R                                     # final canonical W
+
         print()
-        print("Mean Wtilde:\n", mean_Wtilde)
+        print("W_canon:\n", np.round(W_canon.cpu().numpy(), 4))
         print()
-        print("Variance Wtilde:\n", var_Wtilde)
-    
+        print("W_sym:\n", R.T @ W_sym @ R)
         print()
-        # E_true: (V, dE) target embeddings (unit norm)
-        # Etilde: (V, dE) empirical embeddings (unit norm, after whitening)
-        # W_true: (dE, dE) (identity)
-        # WE_final_torch: (dE, dE) learned metric
-        # tau: scalar, model.tau.item()
-        # true_beta: scalar, used for target logits
+        print("W_asym:\n", R.T @ W_asym @ R)
+        print()
+        print("W_diag:\n", W_diag)
+        print()
 
-
+        # Compare centered logits from true vs. empirical model (using earlier l_empirical)
         l_target_centered = l_target - l_target.mean(dim=1, keepdim=True)
         l_empirical_centered = l_empirical - l_empirical.mean(dim=1, keepdim=True)
         D_centered = l_empirical_centered - l_target_centered
-
-        # Target logits
-        l_target = true_beta * (E_true @ W_true @ E_true.t())
-
-        # Empirical logits
-        l_empirical = tau * (Etilde @ WE_final_torch @ Etilde.t())
-
-        D = l_empirical - l_target
-
-        print("\n--- Target vs. Empirical Logits ---")
-        print("Mean difference:", D.abs().mean().item())
-        print("Median difference:", D.abs().median().item())
-        print("Std difference:", D.abs().std().item())
-        print("Min difference:", D.abs().min().item())
-        print("Max difference:", D.abs().max().item())
 
         print("\n--- Centered Target vs. Empirical Logits ---")
         print("Centered Mean difference:", D_centered.abs().mean().item())
@@ -766,11 +780,13 @@ def run(
         print("Centered Max difference:", D_centered.abs().max().item())
 
         print("\n--- Q's ---")
-        print("Mean absolute difference between Q_model and Q_true:", (P_hat_bigram - P_true).abs().mean().item())
-        print(" Median difference:", (P_hat_bigram - P_true).abs().median().item())
-        print(" Std difference:", (P_hat_bigram - P_true).abs().std().item())
-        print(" Min difference:",(P_hat_bigram - P_true).abs().min().item())
-        print(" Max difference:",(P_hat_bigram - P_true).abs().max().item())
+        diff_Q = (P_hat_bigram - P_true).abs()
+        print("Mean absolute difference between Q_model and Q_true:", diff_Q.mean().item())
+        print(" Median difference:", diff_Q.median().item())
+        print(" Std difference:", diff_Q.std().item())
+        print(" Min difference:", diff_Q.min().item())
+        print(" Max difference:", diff_Q.max().item())
+        print()
     # --- end whitening ---
 
 
