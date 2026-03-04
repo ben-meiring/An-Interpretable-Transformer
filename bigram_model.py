@@ -4,7 +4,7 @@ import torch
 import math
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.neighbors import NearestNeighbors
+#from sklearn.neighbors import NearestNeighbors
 import matplotlib.pyplot as plt
 from matplotlib import animation
 from mpl_toolkits.mplot3d import Axes3D  # required for 3D plotting backend
@@ -135,20 +135,27 @@ class PosAttn_TokenOut(nn.Module):
         #p = make_circle_positions(L)          # (L,2)
         self.Ppos = nn.Parameter(p)
 
-        # position metric (2x2)
-        self.Mp = nn.Parameter(torch.eye(2, dtype=torch.get_default_dtype()))
+        # full position metric (5x5); initialize with small random entries so all weights are free
+        M_init = 0.01 * torch.randn(5, 5, dtype=torch.get_default_dtype())
+        self.M = nn.Parameter(M_init)
 
         # positive scales (avoid NaNs / sign flips)
         self.raw_beta_attn = nn.Parameter(torch.tensor(1.5, dtype=torch.get_default_dtype()))
         self.raw_tau = nn.Parameter(torch.tensor(0.0, dtype=torch.get_default_dtype()))
 
-        # token metric for output
-        self.WE = nn.Parameter(torch.eye(dE, dtype=torch.get_default_dtype()))
+        # full 5x5 token metric; top-right 3x3 block (WE) will be used for logits/embeddings
+        W_init = 0.01 * torch.randn(5, 5, dtype=torch.get_default_dtype())
+        self.W = nn.Parameter(W_init)
 
         # causal mask j < i, BUT we will also allow (0,0) to avoid all -inf row
         mask = torch.tril(torch.ones(L, L, dtype=torch.bool), diagonal=-1)
         mask[0, 0] = True
         self.register_buffer("causal_mask", mask)
+
+    @property
+    def Mp(self):
+        """2x2 sub-metric acting on the 2D positions (bottom-right block of M)."""
+        return self.M[-2:, -2:]
 
     @property
     def beta_attn(self):
@@ -164,6 +171,11 @@ class PosAttn_TokenOut(nn.Module):
         Ppart = self.Ppos.unsqueeze(0).expand(B, L, 2)  # (B,L,2)
         # Return raw embeddings and positions (no normalization here).
         return Epart, Ppart
+
+    @property
+    def WE(self):
+        """Top-left 3x3 block of the 5x5 token metric W, acting on embeddings."""
+        return self.W[0:self.dE, 0:self.dE]
 
     def attn_weights(self):
         L = self.L
@@ -256,11 +268,11 @@ def alpha_diagnostics(model):
 # -----------------------------
 def run(
     disorder_mode="none",
-    V=100,
+    V=20,
     dE=3,
     n_seqs=2*(100**2),
     seq_len=8,
-    n_epochs=300,
+    n_epochs=100,
     lr=5e-3,
     batch_size=300,
     true_beta=1.0,
@@ -316,7 +328,7 @@ def run(
             #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             opt.step()
 
-            if (batch_counter % (500 * math.ceil(n_seqs / batch_size)) == 0) or (epoch == n_epochs - 1 and i + batch_size >= n_seqs):
+            if (batch_counter % (200 * math.ceil(n_seqs / batch_size)) == 0) or (epoch == n_epochs - 1 and i + batch_size >= n_seqs):
                 #if step % 1000 == 0 or step == steps - 1:
                 avg_prev, avg_comp = alpha_diagnostics(model)
                 print(
@@ -343,8 +355,6 @@ def run(
                 pos_snapshots.append(model.Ppos.detach().cpu().numpy().copy())  # (L,2)
                 E_snapshots.append(model.E.weight.detach().cpu().numpy().copy())  # (V,dE)
                 alpha_snapshots.append(model.attn_weights().detach().cpu().numpy().copy())  # (L,L)
-                # Mp_snapshots.append(model.Mp.detach().cpu().numpy().copy())  # <-- Add this line
-                # WE_snapshots.append(model.Mp.detach().cpu().numpy().copy())  # <-- Add this line
 
                 E_snapshot = model.E.weight.detach()
                 tau_snapshot = float(model.tau.item())
@@ -355,7 +365,7 @@ def run(
 
                 snapshot_steps.append(batch_counter)
                 batch_counter += 1
-                #snapshot_steps.append((i // batch_size))
+
             except Exception:
                 pass
 
@@ -366,76 +376,18 @@ def run(
     end_time = time.time()
     elapsed = end_time - start_time
     print(f"\nTotal training time: {elapsed:.2f} seconds ({elapsed/60:.2f} minutes)")
-    # for step in range(steps):
-    #     idx = torch.randint(0, n_seqs, (batch_size,))
-    #     x = seqs_data[idx]
-    #     # print(step)
-
-    #     logits = model(x)        # (bs,L-1,V)
-        
-    #     targets = x[:, 1:]
-    #     loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1))
-
-    #     p_norms = model.Ppos.norm(dim=1)
-    #     E_norms = model.E.weight.norm(dim=1)
-    #     radius_penalty = ((p_norms - 1.0) ** 2).mean() + ((E_norms - 1.0) ** 2).mean()
-        
-    #     #loss = loss + l2_lambda * radius_penalty
-
-    #     opt.zero_grad()
-    #     loss.backward()
-    #     # optional: clip to be extra safe
-    #     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-    #     opt.step()
-
-        # if step % 1000 == 0 or step == steps - 1:
-        #     avg_prev, avg_comp = alpha_diagnostics(model)
-        #     print(
-        #         f"Step {step:4d} | loss {loss.item():.6f} | "
-        #         f"alpha[i,i-1] mean {avg_prev:.3f} | max competitor mean {avg_comp:.3f} | "
-        #         f"beta_attn {float(model.beta_attn.item()):.3f} | tau {float(model.tau.item()):.3f}"
-        #     )
-        #     # Print average embedding and position norms
-        #     avg_E = model.E.weight.norm(dim=1).mean().item()
-        #     avg_p = model.Ppos.data.norm(dim=1).mean().item()
-
-        #     # Compute mean |s| (concatenated and normalized vector)
-        #     with torch.no_grad():
-        #         Epart, Ppart = model._parts(x)
-        #         s = torch.cat([Epart, Ppart], dim=-1)
-        #         mean_s = s.norm(dim=-1).mean().item()
-
-        #     print(f"Mean |E|: {avg_E:.4f} | Mean |p|: {avg_p:.4f} | Mean |s|: {mean_s:.4f}")
-        # # record snapshots for animation (positions and entire embedding table)
-        # try:
-        #     pos_snapshots.append(model.Ppos.detach().cpu().numpy().copy())  # (L,2)
-        #     E_snapshots.append(model.E.weight.detach().cpu().numpy().copy())  # (V,dE)
-        #     alpha_snapshots.append(model.attn_weights().detach().cpu().numpy().copy())  # (L,L)
-        #     # Mp_snapshots.append(model.Mp.detach().cpu().numpy().copy())  # <-- Add this line
-        #     # WE_snapshots.append(model.Mp.detach().cpu().numpy().copy())  # <-- Add this line
-
-        #     E_snapshot = model.E.weight.detach()
-        #     tau_snapshot = float(model.tau.item())
-        #     WE_snapshot = model.WE.detach()
-        #     l_empirical = tau_snapshot * (E_snapshot @ WE_snapshot @ E_snapshot.t())  # (V, V)
-        #     D_abs = (l_empirical - l_target).abs().cpu().numpy()
-        #     D_abs_snapshots.append(D_abs)
-
-        #     snapshot_steps.append(step)
-        # except Exception:
-        #     pass
+    
 
     L_full = full_data_loss(model, seqs_data)
 
     #P_hat_bigram = implied_bigram_Phat(model)
     P_hat_bigram = implied_bigram_Phat_forwardlike(model)
     CE_row = rowfreq_cross_entropy(Q, P_hat_bigram, row_freq)
-    
-    # P_hat_bigram = implied_bigram_Phat_consistent(model)
-    # CE_row = rowfreq_cross_entropy(Q, P_hat_bigram, row_freq)
+
 
     avg_prev, avg_comp = alpha_diagnostics(model)
 
+    print()
     print("\n=== Summary ===")
     print(f"Disorder mode: {disorder_mode}")
     print(f"Full-data loss (model forward): {L_full:.6f}")
@@ -444,41 +396,29 @@ def run(
     print(f"Alpha diagnostic: mean alpha[i,i-1]={avg_prev:.3f} | mean max competitor={avg_comp:.3f}")
     print("||P_hat_bigram - Q||_F =", float(torch.norm(P_hat_bigram - Q).item()))
     print("||P_hat_bigram - P_true||_F =", float(torch.norm(P_hat_bigram - P_true).item()))
+    print()
 
-    # print the learned token metric WE for inspection
+    # print the learned token metric W and its WE block for inspection
+    # try:
+    #     W_val = model.W.detach().cpu().numpy()
+    #     print("\nLearned full token metric W (5x5):")
+    #     print(np.round(W_val, 2))
+
+    #     WE_val = model.WE.detach().cpu().numpy()
+    #     print("\nTop-right 3x3 block WE (used for logits/embeddings):")
+    #     print(np.round(WE_val, 4))
+    # except Exception as e:
+    #     print("Could not print model.W / WE:", e)
+    # #     # print the learned position metric Mp for inspection
     try:
-        WE_val = model.WE.detach().cpu().numpy()
-        print("\nLearned token metric WE:")
-        print(np.round(WE_val, 4))
+        Mp_val = model.M.detach().cpu().numpy()
+        print("\nLearned full position metric M (5x5):")
+        print(np.round(Mp_val, 2))
 
-        # Compute symmetric and antisymmetric parts for token metric
-        S_E = 0.5 * (WE_val + WE_val.T)
-        K_E = 0.5 * (WE_val - WE_val.T)
-        eigvals_E, eigvecs_E = np.linalg.eigh(S_E)
-        if whiten_positions:
-            eigvals_E_clipped = np.clip(eigvals_E, 1e-8, None)
-            U_E = eigvecs_E @ np.diag(1.0 / np.sqrt(eigvals_E_clipped))
-        else:
-            U_E = eigvecs_E  # Just diagonalize, no whitening
-
-        W_S = U_E.T @ S_E @ U_E
-        W_K = U_E.T @ K_E @ U_E
-
-        print("\nW_S = 1/2 U_E^T(WE + WE^T)U_E:")
-        print(np.round(W_S, 4))
-        print("\nW_K = 1/2 U_E^T(WE - WE^T)U_E:")
-        print(np.round(W_K, 4))
-    except Exception as e:
-        print("Could not print model.WE or transformed token metrics:", e)
-        # print the learned position metric Mp for inspection
-    try:
-        Mp_val = model.Mp.detach().cpu().numpy()
-        print("\nLearned position metric Mp:")
-        print(np.round(Mp_val, 4))
-
-        # Compute symmetric and antisymmetric parts
-        S = 0.5 * (Mp_val + Mp_val.T)
-        K = 0.5 * (Mp_val - Mp_val.T)
+        # Compute symmetric and antisymmetric parts for the 2x2 Mp sub-metric
+        Mp_2x2 = Mp_val[-2:, -2:]
+        S = 0.5 * (Mp_2x2 + Mp_2x2.T)
+        K = 0.5 * (Mp_2x2 - Mp_2x2.T)
         eigvals, eigvecs = np.linalg.eigh(S)
         if whiten_positions:
             eigvals_clipped = np.clip(eigvals, 1e-8, None)
@@ -490,16 +430,17 @@ def run(
         M_S = U.T @ S @ U
         M_K = U.T @ K @ U
 
-        print("\nM_S = 1/2 U^T(M + M^T)U:")
-        print(np.round(M_S, 4))
-        print("\nM_K = 1/2 U^T(M - M^T)U:")
-        print(np.round(M_K, 4))
+        print("\nM_S + M_K (2x2):")
+        print(np.round(M_S + M_K, 4))
+        print()
 
     except Exception as e:
-        print("Could not print model.Mp or transformed metrics:", e)
-    # ---------------------------
+        print("Could not print model.M or transformed metrics:", e)
+
+    # # ---------------------------
     # Build and save animations for Ppos and embeddings over snapshots
     # ---------------------------
+    
     if len(pos_snapshots) == 0:
         # no snapshots recorded (very short run) — use final state
         pos_snapshots = [model.Ppos.detach().cpu().numpy().copy()]
@@ -512,8 +453,6 @@ def run(
     E_snapshots = E_snapshots[::stride]
     alpha_snapshots = alpha_snapshots[::stride]
     D_abs_snapshots = D_abs_snapshots[::stride]
-    # Mp_snapshots = Mp_snapshots[::stride]
-    # WE_snapshots = WE_snapshots[::stride]
     snapshot_steps = snapshot_steps[::stride]
     Mp_final = model.Mp.detach().cpu().numpy()
 
@@ -668,70 +607,14 @@ def run(
 
     # --- whiten embeddings (global linear whitening, score-preserving) ---
     with torch.no_grad():
-        # Symmetric/antisymmetric decomposition of learned token metric
-        S = 0.5 * (WE_final_torch + WE_final_torch.T)
-        K = 0.5 * (WE_final_torch - WE_final_torch.T)
 
-        # 1. Diagonalize symmetric part S
-        eigvals, U = torch.linalg.eigh(S)  # S = U @ diag(eigvals) @ U.T
-
-        # 2. Transform embeddings into S's eigenbasis
         E = model.E.weight.detach()        # [V, dE]
-        E_prime = E @ U                    # [V, dE]
-        V, dE = E_prime.shape
-
-        # Center embeddings in eigenbasis (used for recovering W)
-        mu_prime = E_prime.mean(dim=0, keepdim=True)      # [1, dE]
-        Eprime_c = E_prime - mu_prime                    # [V, dE]
-
-        # Build centered logit matrix from learned metric
-        S_full = tau * (E @ WE_final_torch @ E.T)        # [V, V]
-        S_tilde = S_full - S_full.mean(dim=1, keepdim=True)  # Row-mean subtraction
-
-        # Recover W in eigenbasis via regularized least squares
-        A = E_prime
-        B = Eprime_c
-        lam = 1e-3
-
-        AtA = A.T @ A
-        BtB = B.T @ B
-        I = torch.eye(dE, device=A.device, dtype=A.dtype)
-
-        M = A.T @ S_tilde @ B
-        X = torch.linalg.solve(AtA + lam * I, M)
-        W_eig_hat = torch.linalg.solve(BtB + lam * I, X.T).T
-        W_eig_hat = W_eig_hat / tau                        # [dE, dE]
-
-        # Map recovered W back to original basis
-        W_hat = U @ W_eig_hat @ U.T                        # [dE, dE]
-        print("\nRecovered W (original basis):\n", W_hat)
-
-        # Build per-token effective metric tensors using recovered W_hat
-        Etilde = E_prime / E_prime.norm(dim=1, keepdim=True)  # [V, dE]
-        norms_squared = E_prime.norm(dim=1) ** 2              # [V]
-        Wtilde = tau * torch.stack([W_hat * ns for ns in norms_squared])  # [V, dE, dE]
-
-        mean_Wtilde = Wtilde.mean(dim=0)
-        var_Wtilde = Wtilde.var(dim=0)
-
-        print("\nMean Wtilde:\n", mean_Wtilde)
-        print("\nVar Wtilde:\n", var_Wtilde)
-
-        ## new thing
         V, d = E.shape
         tau_val = float(tau) if not isinstance(tau, float) else tau
 
         Sigma = (E.T @ E) / E.shape[0]
         whitelam, whiteU = torch.linalg.eigh(Sigma)
         whiteA = (whiteU * (1.0 / torch.sqrt(whitelam + 1e-12))) @ whiteU.T
-
-        # print(E.shape[0])
-        # print(Sigma)
-        # print(whiteA @ Sigma @ whiteA.T)
-
-        
-
-        #W_whiten = np.linalg.inv(A).T @ W @ np.linalg.inv(A)
 
 
         # --- 1) Build gauge-fixed logits S_tilde from empirical params ---
@@ -757,14 +640,11 @@ def run(
         W_diag, R = torch.linalg.eigh(W_sym)          # lam ascending, R orthonormal
         W_canon = R.T @ W @ R                                     # final canonical W
 
+        W_5by5 = model.W.detach().cpu().numpy()
+        print("\nLearned full token metric W (5x5):")
+        print(np.round(W_5by5, 2))
         print()
-        print("W_canon:\n", np.round(W_canon.cpu().numpy(), 4))
-        print()
-        print("W_sym:\n", R.T @ W_sym @ R)
-        print()
-        print("W_asym:\n", R.T @ W_asym @ R)
-        print()
-        print("W_diag:\n", W_diag)
+        print("W_canon:\n", np.round(W_canon.cpu().numpy(), 2))
         print()
 
         # Compare centered logits from true vs. empirical model (using earlier l_empirical)
@@ -781,7 +661,7 @@ def run(
 
         print("\n--- Q's ---")
         diff_Q = (P_hat_bigram - P_true).abs()
-        print("Mean absolute difference between Q_model and Q_true:", diff_Q.mean().item())
+        print("Mean difference:", diff_Q.mean().item())
         print(" Median difference:", diff_Q.median().item())
         print(" Std difference:", diff_Q.std().item())
         print(" Min difference:", diff_Q.min().item())
