@@ -48,7 +48,7 @@ class RunConfig:
     dataset_name: str = "dataset_latest.pt"
 
     # experiment
-    V: int = 300  # tokens
+    V: int = 100  # tokens
     dE: int = 3
     n_seqs: int = 20 * (1000)
     seq_len: int = 10
@@ -65,14 +65,14 @@ class RunConfig:
     test_frac: float = .2
 
     # how many tokens to block: frac * V (used if blocked_tokens is empty)
-    blocked_frac: float = 0.05          # e.g. 0.05*V tokens; set to 0.5 for 50%
+    blocked_frac: float = 0.0          # e.g. 0.05*V tokens; set to 0.5 for 50%
     # explicit override: if non-empty, use these indices instead of random
     blocked_tokens: tuple = tuple(
         int(i) for i in np.random.permutation(V)[: int(0.05 * V)]
     )          # () -> sample randomly
 
     # training
-    n_epochs: int = 100
+    n_epochs: int = 60
     lr: float = 3e-3
     batch_size: int = 100
     epochs_per_frame: float = 0.4
@@ -663,8 +663,14 @@ if __name__ == "__main__":
         RunConfig(
             generate_new_data=True,
             train_new_run=True,
-            save_training_animation=False,
-            save_rollout_animation=False,
+            save_training_animation=True,
+            save_rollout_animation=True,
             save_embedding_animation=True,
         )
     )
+# I'd like to make another gen_data method where our transition probability is given by:
+
+# P(E^{t+1} | m^{t}) ~ exp(m^{t} W E^{t+1}) 
+
+# m^{t+1} = (1-mu ) m^{t} + mu E^{t}
+
