@@ -39,7 +39,7 @@ def make_true_P_from_embeddings(V=20, dim=3, beta=1.0, W_true: Optional[torch.Te
 
     ## Defines true probability distribution
     logits = beta * (E_true @ W_true @ E_true.t())
-    logits = logits - logits.max(dim=1, keepdim=True)[0]  # gauge-fix
+    logits = logits - logits.max(dim=1, keepdim=True)[0]  # gauge-fix 
     P = torch.exp(logits)
     P = P / (P.sum(dim=1, keepdim=True) + 1e-12)
 
@@ -158,3 +158,216 @@ def permute_token_ids(P: torch.Tensor, E: Optional[torch.Tensor] = None, *, gene
     P_perm = P[perm][:, perm]
     E_perm = E[perm] if E is not None else None
     return P_perm, E_perm, perm
+
+def sample_memory_sequences(
+    E_true: torch.Tensor,
+    W_true: torch.Tensor,
+    *,
+    beta: float = 1.0,
+    mu: float = 0.1,
+    n_seqs: int = 200,
+    seq_len: int = 500,
+) -> torch.Tensor:
+    """
+    Sample sequences from a latent-memory process:
+
+        P(E^{t+1} | m^t) ∝ exp(m^t W_true E^{t+1})
+        m^{t+1} = (1 - mu) m^t + mu E^t
+
+    where E^t is the embedding of the current token at time t.
+    """
+    V, dim = E_true.shape
+    assert W_true.shape == (dim, dim)
+
+    seqs = torch.zeros(n_seqs, seq_len, dtype=torch.long)
+
+    for s in range(n_seqs):
+        cur = torch.randint(0, V, ()).item()
+        seqs[s, 0] = cur
+        m = E_true[cur].clone()
+
+        for t in range(1, seq_len):
+            tmp = (m.unsqueeze(0) @ W_true)
+            logits = beta * (tmp @ E_true.t()).squeeze(0)
+            probs = torch.softmax(logits, dim=0)
+            nxt = torch.multinomial(probs, 1).item()
+            seqs[s, t] = nxt
+
+            # FIX: update memory toward the *new* token
+            E_next = E_true[nxt]
+            m = (1.0 - mu) * m + mu * E_next
+
+            cur = nxt
+
+    return seqs
+
+
+def make_true_memory_sequences(
+    V: int = 20,
+    dim: int = 3,
+    *,
+    beta: float = 1.0,
+    mu: float = 0.1,
+    W_true: Optional[torch.Tensor] = None,
+    n_seqs: int = 200,
+    seq_len: int = 500,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Convenience wrapper for the latent-memory process:
+
+        P(E^{t+1} | m^t) ∝ exp(m^t W_true E^{t+1})
+        m^{t+1} = (1 - mu) m^t + mu E^t
+    """
+    E_true = fibonacci_sphere(V)  # (V, dim) if adapted for dim; 3D sphere in your case
+
+    if W_true is None:
+        W_true = torch.eye(dim, dtype=torch.get_default_dtype())
+
+    seqs = sample_memory_sequences(
+        E_true,
+        W_true,
+        beta=beta,
+        mu=mu,
+        n_seqs=n_seqs,
+        seq_len=seq_len,
+    )
+    return E_true, W_true, seqs
+
+
+    ## more complicated data_gen
+
+def sample_conv_memory_sequences(
+    E_true: torch.Tensor,
+    W_true: torch.Tensor,
+    alpha: torch.Tensor,
+    *,
+    beta: float = 1.0,
+    n_seqs: int = 200,
+    seq_len: int = 500,
+) -> torch.Tensor:
+    """
+    Sample sequences from a convolutional-memory process:
+
+        m_t = sum_{k >= 0} alpha_k E_{t-k}   (discrete convolution, truncated)
+        P(E_{t+1} | m_t) ∝ exp( m_t^T W_true E_{t+1} )
+
+    Here alpha is a 1D tensor of length K: alpha[k] = weight at lag k.
+    We use only lags k <= t at time t, and renormalize alpha over the
+    available window.
+
+    Args:
+        E_true: (V, dim) token embedding matrix.
+        W_true: (dim, dim) bilinear form matrix.
+        alpha:  (K,) convolution kernel over lags k = 0..K-1.
+        beta:   inverse temperature.
+        n_seqs: number of sequences to sample.
+        seq_len: length of each sequence.
+
+    Returns:
+        seqs: LongTensor of shape (n_seqs, seq_len) with token indices.
+    """
+    V, dim = E_true.shape
+    assert W_true.shape == (dim, dim)
+    alpha = alpha.to(E_true.device).to(E_true.dtype)
+    K = alpha.shape[0]
+
+    # ensure alpha is nonnegative and normalized (in case caller forgot)
+    alpha = torch.clamp(alpha, min=0)
+    if alpha.sum() <= 0:
+        raise ValueError("alpha must have some positive mass.")
+    alpha = alpha / alpha.sum()
+
+    seqs = torch.zeros(n_seqs, seq_len, dtype=torch.long)
+
+    for s in range(n_seqs):
+        # initial token
+        cur = torch.randint(0, V, ()).item()
+        seqs[s, 0] = cur
+
+        # history of token indices; history[t] = index at time t
+        history = [cur]
+
+        for t in range(seq_len - 1):
+            # compute m_t from available history: E_t, E_{t-1}, ...
+            # valid lags: k = 0..min(K-1, t)
+            max_k = min(K - 1, t)
+            # slice the tail of history: [E_t, E_{t-1}, ..., E_{t-max_k}]
+            # and corresponding alpha[0..max_k], renormalized
+            alpha_used = alpha[: max_k + 1]
+            alpha_used = alpha_used / alpha_used.sum()
+
+            # accumulate m_t
+            m = torch.zeros(dim, dtype=E_true.dtype, device=E_true.device)
+            for k in range(max_k + 1):
+                token_idx = history[t - k]          # x_{t-k}
+                m = m + alpha_used[k] * E_true[token_idx]
+
+            # logits_j = beta * m^T W_true E_j
+            tmp = (m.unsqueeze(0) @ W_true)              # (1, dim)
+            logits = beta * (tmp @ E_true.t()).squeeze(0)  # (V,)
+
+            probs = torch.softmax(logits, dim=0)
+            nxt = torch.multinomial(probs, 1).item()
+
+            seqs[s, t + 1] = nxt
+            history.append(nxt)
+            cur = nxt
+
+    return seqs
+
+
+def make_true_conv_memory_sequences(
+    V: int = 20,
+    dim: int = 3,
+    *,
+    beta: float = 1.0,
+    W_true: Optional[torch.Tensor] = None,
+    n_seqs: int = 200,
+    seq_len: int = 500,
+    # kernel controls
+    K: int = 12,
+    peak_lag: int = 5,
+    sigma: float = 1.0,
+    alpha: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Convenience wrapper for a convolutional-memory process:
+
+        m_t = sum_k alpha_k E_{t-k},
+        P(E_{t+1} | m_t) ∝ exp( m_t^T W_true E_{t+1} ).
+
+    If `alpha` is not provided, we build a more complex kernel over lags
+    k = 0..K-1: a mixture of two Gaussians plus a mild sinusoidal term.
+    """
+    E_true = fibonacci_sphere(V)  # (V, 3) for dim=3
+
+    if W_true is None:
+        W_true = torch.eye(dim, dtype=torch.get_default_dtype())
+
+    if alpha is None:
+        ks = torch.arange(K, dtype=torch.get_default_dtype())
+
+        # main bump near `peak_lag`
+        gauss_main = torch.exp(- (ks - float(peak_lag)) ** 2 / (2.0 * sigma ** 2))
+
+        # secondary broader bump farther back in time
+        peak_far = float(peak_lag + 4)
+        sigma_far = sigma * 2.5
+        gauss_far = 0.4 * torch.exp(- (ks - peak_far) ** 2 / (2.0 * sigma_far ** 2))
+
+        # mild sinusoidal modulation over lags
+        sinus = 0.15 * (1.0 + torch.sin(0.7 * ks))
+
+        alpha = gauss_main + gauss_far + sinus
+        alpha = torch.clamp(alpha, min=0)
+        alpha = alpha / alpha.sum()
+
+    seqs = sample_conv_memory_sequences(
+        E_true=E_true,
+        W_true=W_true,
+        alpha=alpha,
+        beta=beta,
+        n_seqs=n_seqs,
+        seq_len=seq_len,
+    )
+    return E_true, W_true, alpha, seqs

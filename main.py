@@ -18,6 +18,8 @@ from source_code.analysis import (
 )
 from source_code.gen_data import (
     make_true_P_from_embeddings,
+    make_true_memory_sequences,
+    make_true_conv_memory_sequences,   # NEW
     sample_markov_sequences,
     markov_entropy_rate,
     save_dataset,
@@ -42,16 +44,26 @@ class RunConfig:
     save_rollout_animation: bool = True
     save_embedding_animation: bool = True
 
+    # choose data type
+    use_memory_data: bool = True   # False = old Markov, True = memory / conv-memory dynamics
+    memory_mu: float = 0.3         # for EMA-style memory (if used)
+
+    # conv-memory kernel params (used by make_true_conv_memory_sequences)
+    use_conv_memory: bool = False   # if True, use conv-memory instead of EMA memory
+    conv_K: int = 12
+    conv_peak_lag: int = 5
+    conv_sigma: float = 1.0
+
     # io
     folder: str = "model_and_data"
     ckpt_name: str = "run_latest.pt"
     dataset_name: str = "dataset_latest.pt"
 
     # experiment
-    V: int = 100  # tokens
+    V: int = 500  # tokens
     dE: int = 3
-    n_seqs: int = 20 * (1000)
-    seq_len: int = 10
+    n_seqs: int = 50 * (1000)
+    seq_len: int = 20
     true_beta: float = 5.0
 
     W_true: torch.Tensor = field(
@@ -72,7 +84,7 @@ class RunConfig:
     )          # () -> sample randomly
 
     # training
-    n_epochs: int = 60
+    n_epochs: int = 800
     lr: float = 3e-3
     batch_size: int = 100
     epochs_per_frame: float = 0.4
@@ -85,37 +97,59 @@ def _get_or_make_dataset(*, cfg: RunConfig):
 
     if (not cfg.generate_new_data) and os.path.exists(data_path):
         train_seqs, test_seqs, E_true, W_true, P_true, data_meta = load_dataset(data_path)
-        if E_true is None or W_true is None or P_true is None:
-            raise ValueError(f"{data_path} is missing E_true/W_true/P_true.")
+        if E_true is None or W_true is None:  # P_true may be None for memory data
+            raise ValueError(f"{data_path} is missing E_true/W_true.")
         return train_seqs, test_seqs, E_true, W_true, P_true, data_meta
 
     # --- generate + save ---
 
-    # define blocked tokens from config (can be empty)
-    if cfg.blocked_tokens:
-        blocked = torch.tensor(cfg.blocked_tokens, dtype=torch.long)
-    else:
+    if cfg.use_memory_data:
+        # NEW: latent memory dynamics, no global P_true
+        if cfg.use_conv_memory:
+            # convolutional memory: m_t = sum_k alpha_k E_{t-k}
+            E_true, W_true, alpha, seqs = make_true_conv_memory_sequences(
+                V=cfg.V,
+                dim=cfg.dE,
+                beta=cfg.true_beta,
+                W_true=cfg.W_true,
+                n_seqs=cfg.n_seqs,
+                seq_len=cfg.seq_len,
+                K=cfg.conv_K,
+                peak_lag=cfg.conv_peak_lag,
+                sigma=cfg.conv_sigma,
+                alpha=None,  # let the helper build the Gaussian kernel
+            )
+        else:
+            # original EMA-style memory
+            E_true, W_true, seqs = make_true_memory_sequences(
+                V=cfg.V,
+                dim=cfg.dE,
+                beta=cfg.true_beta,
+                mu=cfg.memory_mu,
+                W_true=cfg.W_true,
+                n_seqs=cfg.n_seqs,
+                seq_len=cfg.seq_len,
+            )
+            alpha = None
+
+        P_true = None
         blocked = None
+    else:
+        # existing Markov data
+        if cfg.blocked_tokens:
+            blocked = torch.tensor(cfg.blocked_tokens, dtype=torch.long)
+        else:
+            blocked = None
 
-    E_true, P_true, W_true = make_true_P_from_embeddings(
-        V=cfg.V,
-        dim=cfg.dE,
-        beta=cfg.true_beta,
-        W_true=cfg.W_true,
-        blocked_tokens=blocked,
-    )
-
-    # flat check ...
-    with torch.no_grad():
-        z_true = E_true[:, 2].detach().cpu().numpy()
-        z_edges = np.linspace(-1.0, 1.0, 41)
-        dz = z_edges[1] - z_edges[0]
-        hist, _ = np.histogram(z_true, bins=z_edges)
-        dens = hist / (hist.sum() * dz)
-        print("[z_true support] mean/std density:", float(dens.mean()), float(dens.std()))
-        print("[z_true support] min/max density :", float(dens.min()), float(dens.max()))
-
-    seqs = sample_markov_sequences(P_true, n_seqs=cfg.n_seqs, seq_len=cfg.seq_len)
+        E_true, P_true, W_true = make_true_P_from_embeddings(
+            V=cfg.V,
+            dim=cfg.dE,
+            beta=cfg.true_beta,
+            W_true=cfg.W_true,
+            blocked_tokens=blocked,
+        )
+        alpha = None
+        seqs = sample_markov_sequences(P_true, n_seqs=cfg.n_seqs, seq_len=cfg.seq_len)
 
     # --- train/test split ---
     n_total = seqs.shape[0]
@@ -134,7 +168,14 @@ def _get_or_make_dataset(*, cfg: RunConfig):
         true_beta=cfg.true_beta,
         test_frac=cfg.test_frac,
         n_seqs=cfg.n_seqs,
-        blocked_tokens=blocked.cpu().numpy() if blocked is not None else None,
+        blocked_tokens=blocked.cpu().numpy() if (not cfg.use_memory_data and blocked is not None) else None,
+        use_memory_data=cfg.use_memory_data,
+        memory_mu=cfg.memory_mu if (cfg.use_memory_data and not cfg.use_conv_memory) else None,
+        use_conv_memory=cfg.use_conv_memory if cfg.use_memory_data else None,
+        conv_K=cfg.conv_K if (cfg.use_memory_data and cfg.use_conv_memory) else None,
+        conv_peak_lag=cfg.conv_peak_lag if (cfg.use_memory_data and cfg.use_conv_memory) else None,
+        conv_sigma=cfg.conv_sigma if (cfg.use_memory_data and cfg.use_conv_memory) else None,
+        alpha=alpha.cpu().numpy() if (cfg.use_memory_data and cfg.use_conv_memory and alpha is not None) else None,
     )
 
     save_dataset(
@@ -143,7 +184,7 @@ def _get_or_make_dataset(*, cfg: RunConfig):
         test_seqs=test_seqs,
         E_true=E_true,
         W_true=W_true,
-        P_true=P_true,
+        P_true=P_true,   # will be None for memory / conv-memory data
         meta=data_meta,
     )
     return train_seqs, test_seqs, E_true, W_true, P_true, data_meta
@@ -166,131 +207,135 @@ def main(cfg: RunConfig = RunConfig()):
         blocked_tokens = np.asarray(blocked_tokens, dtype=int)
 
     # --- Stationary axial density of the TRUE discrete chain (for comparison) ---
-    with torch.no_grad():
-        # P_true is row-stochastic: shape (V, V)
-        P = P_true.detach()  # (V, V)
+    if P_true is not None and torch.is_tensor(P_true):
+        with torch.no_grad():
+            # P_true is row-stochastic: shape (V, V)
+            P = P_true.detach()  # (V, V)
 
-        # Find stationary distribution π: left eigenvector of P with eigenvalue 1
-        # i.e. eigenvector of P^T with eigenvalue ~1
-        eigvals, eigvecs = torch.linalg.eig(P.t())
-        eigvals = eigvals.real
-        eigvecs = eigvecs.real  # (V, V) columns are eigenvectors
+            # Find stationary distribution π: left eigenvector of P with eigenvalue 1
+            # i.e. eigenvector of P^T with eigenvalue ~1
+            eigvals, eigvecs = torch.linalg.eig(P.t())
+            eigvals = eigvals.real
+            eigvecs = eigvecs.real  # (V, V) columns are eigenvectors
 
-        idx = torch.argmin((eigvals - 1.0).abs())
-        pi = eigvecs[:, idx]                # (V,)
-        pi = pi / pi.sum()                  # normalize
-        pi = pi.clamp(min=0)
-        pi = pi / pi.sum()                  # re-normalize after clamp
+            idx = torch.argmin((eigvals - 1.0).abs())
+            pi = eigvecs[:, idx]                # (V,)
+            pi = pi / pi.sum()                  # normalize
+            pi = pi.clamp(min=0)
+            pi = pi / pi.sum()                  # re-normalize after clamp
 
-        # z-coordinates from TRUE embedding (same gauge as theory)
-        z_true = E_true[:, 2].detach().cpu().numpy()
-        pi_np = pi.detach().cpu().numpy()
+            # z-coordinates from TRUE embedding (same gauge as theory)
+            z_true = E_true[:, 2].detach().cpu().numpy()
+            pi_np = pi.detach().cpu().numpy()
 
-        # build a stationary axial density from the discrete chain
-        n_bins = 40
-        z_edges = np.linspace(-1.0, 1.0, n_bins + 1)
-        z_centers = 0.5 * (z_edges[:-1] + z_edges[1:])
-        dz = z_edges[1] - z_edges[0]
+            # build a stationary axial density from the discrete chain
+            n_bins = 40
+            z_edges = np.linspace(-1.0, 1.0, n_bins + 1)
+            z_centers = 0.5 * (z_edges[:-1] + z_edges[1:])
+            dz = z_edges[1] - z_edges[0]
 
-        stat_hist, _ = np.histogram(z_true, bins=z_edges, weights=pi_np)
-        rho_stat = stat_hist / (stat_hist.sum() * dz)  # stationary ρ(z) from P_true
+            stat_hist, _ = np.histogram(z_true, bins=z_edges, weights=pi_np)
+            rho_stat = stat_hist / (stat_hist.sum() * dz)  # stationary ρ(z) from P_true
 
-        # analytic continuum theory
-        from source_code.analysis import p_z
-        a = float(W_true[1, 0].detach().cpu().item())
-        rho_theory = p_z(z_centers, a=a, beta=cfg.true_beta)
+            # analytic continuum theory
+            from source_code.analysis import p_z
+            a = float(W_true[1, 0].detach().cpu().item())
+            rho_theory = p_z(z_centers, a=a, beta=cfg.true_beta)
 
-        l1_discrete_vs_theory = np.sum(np.abs(rho_stat - rho_theory)) * dz
-        print("\n[true chain ρ(z)]")
-        print("  mean/std rho_stat :", float(rho_stat.mean()), float(rho_stat.std()))
-        print("  L1(ρ_stat, ρ_theory):", float(l1_discrete_vs_theory))
+            l1_discrete_vs_theory = np.sum(np.abs(rho_stat - rho_theory)) * dz
+            print("\n[true chain ρ(z)]")
+            print("  mean/std rho_stat :", float(rho_stat.mean()), float(rho_stat.std()))
+            print("  L1(ρ_stat, ρ_theory):", float(l1_discrete_vs_theory))
 
-        # --- Plot discrete stationary ρ(z) vs analytic p_z(z) ---
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(
-            z_centers,
-            rho_theory,
-            "r-",
-            lw=2,
-            label="Analytic $p_z(z)$",
-        )
-        ax.step(
-            z_centers,
-            rho_stat,
-            where="mid",
-            color="k",
-            lw=1.5,
-            label="Discrete stationary $\\rho_{\\text{stat}}(z)$",
-        )
-        ax.set_xlabel("$z$")
-        ax.set_ylabel("density")
-        ax.set_title("True chain stationary axial density vs theory")
-        ax.legend(loc="best")
-        ax.grid(alpha=0.2)
+            # --- Plot discrete stationary ρ(z) vs analytic p_z(z) ---
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(
+                z_centers,
+                rho_theory,
+                "r-",
+                lw=2,
+                label="Analytic $p_z(z)$",
+            )
+            ax.step(
+                z_centers,
+                rho_stat,
+                where="mid",
+                color="k",
+                lw=1.5,
+                label="Discrete stationary $\\rho_{\\text{stat}}(z)$",
+            )
+            ax.set_xlabel("$z$")
+            ax.set_ylabel("density")
+            ax.set_title("True chain stationary axial density vs theory")
+            ax.legend(loc="best")
+            ax.grid(alpha=0.2)
 
-        out_png = os.path.join(cfg.folder, "true_chain_stationary_z.png")
-        fig.tight_layout()
-        fig.savefig(out_png, dpi=150)
-        plt.close(fig)
-        print("Saved true-chain ρ(z) plot to:", out_png)
+            out_png = os.path.join(cfg.folder, "true_chain_stationary_z.png")
+            fig.tight_layout()
+            fig.savefig(out_png, dpi=150)
+            plt.close(fig)
+            print("Saved true-chain ρ(z) plot to:", out_png)
 
-        # --- Debias the discrete stationary ρ(z) in the same way as the rollout animation ---
+            # --- Debias the discrete stationary ρ(z) in the same way as the rollout animation ---
 
-        # Token "support" density from TRUE embedding (unweighted histogram)
-        token_hist_true, _ = np.histogram(z_true, bins=z_edges)
-        token_density_true = token_hist_true.astype(np.float64) / max(token_hist_true.sum() * dz, 1e-12)
-        token_density_true_safe = np.maximum(token_density_true, 1e-12)
+            # Token "support" density from TRUE embedding (unweighted histogram)
+            token_hist_true, _ = np.histogram(z_true, bins=z_edges)
+            token_density_true = token_hist_true.astype(np.float64) / max(token_hist_true.sum() * dz, 1e-12)
+            token_density_true_safe = np.maximum(token_density_true, 1e-12)
 
-        # Debiased stationary density: ρ_stat / ρ_token, re-normalized
-        rho_stat_debias = rho_stat / token_density_true_safe
-        rho_stat_debias = rho_stat_debias / max(np.sum(rho_stat_debias) * dz, 1e-12)
+            # Debiased stationary density: ρ_stat / ρ_token, re-normalized
+            rho_stat_debias = rho_stat / token_density_true_safe
+            rho_stat_debias = rho_stat_debias / max(np.sum(rho_stat_debias) * dz, 1e-12)
 
-        l1_debias_vs_theory = np.sum(np.abs(rho_stat_debias - rho_theory)) * dz
-        print("\n[true chain ρ(z) debiased with token support]")
-        print("  mean/std rho_stat_debias :", float(rho_stat_debias.mean()), float(rho_stat_debias.std()))
-        print("  L1(ρ_stat_debias, ρ_theory):", float(l1_debias_vs_theory))
+            l1_debias_vs_theory = np.sum(np.abs(rho_stat_debias - rho_theory)) * dz
+            print("\n[true chain ρ(z) debiased with token support]")
+            print("  mean/std rho_stat_debias :", float(rho_stat_debias.mean()), float(rho_stat_debias.std()))
+            print("  L1(ρ_stat_debias, ρ_theory):", float(l1_debias_vs_theory))
 
-        # Plot: analytic vs discrete vs debiased
-        fig2, ax2 = plt.subplots(figsize=(6, 4))
-        ax2.plot(
-            z_centers,
-            rho_theory,
-            "r-",
-            lw=2,
-            label="Analytic $p_z(z)$",
-        )
-        ax2.step(
-            z_centers,
-            rho_stat,
-            where="mid",
-            color="k",
-            lw=1.5,
-            alpha=0.7,
-            label="Discrete $\\rho_{\\text{stat}}(z)$",
-        )
-        ax2.step(
-            z_centers,
-            rho_stat_debias,
-            where="mid",
-            color="b",
-            lw=1.5,
-            alpha=0.7,
-            label="Debiased $\\rho_{\\text{stat}}(z)/\\rho_\\text{token}(z)$",
-        )
-        ax2.set_xlabel("$z$")
-        ax2.set_ylabel("density")
-        ax2.set_title("True chain ρ(z): raw vs debiased vs theory")
-        ax2.legend(loc="best")
-        ax2.grid(alpha=0.2)
+            # Plot: analytic vs discrete vs debiased
+            fig2, ax2 = plt.subplots(figsize=(6, 4))
+            ax2.plot(
+                z_centers,
+                rho_theory,
+                "r-",
+                lw=2,
+                label="Analytic $p_z(z)$",
+            )
+            ax2.step(
+                z_centers,
+                rho_stat,
+                where="mid",
+                color="k",
+                lw=1.5,
+                alpha=0.7,
+                label="Discrete $\\rho_{\\text{stat}}(z)$",
+            )
+            ax2.step(
+                z_centers,
+                rho_stat_debias,
+                where="mid",
+                color="b",
+                lw=1.5,
+                alpha=0.7,
+                label="Debiased $\\rho_{\\text{stat}}(z)/\\rho_\\text{token}(z)$",
+            )
+            ax2.set_xlabel("$z$")
+            ax2.set_ylabel("density")
+            ax2.set_title("True chain ρ(z): raw vs debiased vs theory")
+            ax2.legend(loc="best")
+            ax2.grid(alpha=0.2)
 
-        out_png2 = os.path.join(cfg.folder, "true_chain_stationary_z_debiased.png")
-        fig2.tight_layout()
-        fig2.savefig(out_png2, dpi=150)
-        plt.close(fig2)
-        print("Saved debiased true-chain ρ(z) plot to:", out_png2)
-    # theoretical entropy floor from stored P_true (nats)
-    P_np = P_true.detach().cpu().numpy() if torch.is_tensor(P_true) else P_true
-    H_theory = markov_entropy_rate(P_np)
+            out_png2 = os.path.join(cfg.folder, "true_chain_stationary_z_debiased.png")
+            fig2.tight_layout()
+            fig2.savefig(out_png2, dpi=150)
+            plt.close(fig2)
+            print("Saved debiased true-chain ρ(z) plot to:", out_png2)
+
+        # theoretical entropy floor from stored P_true (nats)
+        P_np = P_true.detach().cpu().numpy()
+        H_theory = markov_entropy_rate(P_np)
+    else:
+        H_theory = 0.0  # no Markov-theory floor for memory data
 
     # recompute target logits (do not store)
     target_logits = cfg.true_beta * (E_true @ W_true @ E_true.t())
@@ -313,7 +358,7 @@ def main(cfg: RunConfig = RunConfig()):
             L=cfg.seq_len,
             dE=cfg.dE,
             use_batch_invariant_alpha=True,
-            use_identity_Mp=True,
+            use_identity_Mp=False,
         )
         
         model, snaps, meta, rec, snaps_tilde = train_model(
@@ -352,73 +397,74 @@ def main(cfg: RunConfig = RunConfig()):
     # -------------------------------------------------------------
     # Learned embedding: support and stationary ρ(z), before/after debias
     # -------------------------------------------------------------
-    with torch.no_grad():
-        # Recompute stationary π of the TRUE chain (same as above)
-        P = P_true.detach()
-        eigvals, eigvecs = torch.linalg.eig(P.t())
-        eigvals = eigvals.real
-        eigvecs = eigvecs.real
+    if P_true is not None and torch.is_tensor(P_true):
+        with torch.no_grad():
+            # Recompute stationary π of the TRUE chain (same as above)
+            P = P_true.detach()
+            eigvals, eigvecs = torch.linalg.eig(P.t())
+            eigvals = eigvals.real
+            eigvecs = eigvecs.real
 
-        idx = torch.argmin((eigvals - 1.0).abs())
-        pi = eigvecs[:, idx]
-        pi = pi / pi.sum()
-        pi = pi.clamp(min=0)
-        pi = pi / pi.sum()
-        pi_np = pi.detach().cpu().numpy()
+            idx = torch.argmin((eigvals - 1.0).abs())
+            pi = eigvecs[:, idx]
+            pi = pi / pi.sum()
+            pi = pi.clamp(min=0)
+            pi = pi / pi.sum()
+            pi_np = pi.detach().cpu().numpy()
 
-        # Learned embedding in rollout gauge: E_learn_plot = E_model @ T_E (if available)
-        E_model = model.E.weight.detach().cpu().numpy()  # (V, dE)
-        if rec is not None and "T_E" in rec:
-            T_E = np.asarray(rec["T_E"])                 # (dE, dE)
-            E_learn_plot = E_model @ T_E
-        else:
-            E_learn_plot = E_model
+            # Learned embedding in rollout gauge: E_learn_plot = E_model @ T_E (if available)
+            E_model = model.E.weight.detach().cpu().numpy()  # (V, dE)
+            if rec is not None and "T_E" in rec:
+                T_E = np.asarray(rec["T_E"])                 # (dE, dE)
+                E_learn_plot = E_model @ T_E
+            else:
+                E_learn_plot = E_model
 
-        z_learn = E_learn_plot[:, 2]
+            z_learn = E_learn_plot[:, 2]
 
-        # Same binning as before
-        n_bins = 40
-        z_edges = np.linspace(-1.0, 1.0, n_bins + 1)
-        z_centers = 0.5 * (z_edges[:-1] + z_edges[1:])
-        dz = z_edges[1] - z_edges[0]
+            # Same binning as before
+            n_bins = 40
+            z_edges = np.linspace(-1.0, 1.0, n_bins + 1)
+            z_centers = 0.5 * (z_edges[:-1] + z_edges[1:])
+            dz = z_edges[1] - z_edges[0]
 
-        # (1) Learned token support density in z
-        hist_learn_support, _ = np.histogram(z_learn, bins=z_edges)
-        dens_learn_support = hist_learn_support.astype(np.float64) / max(hist_learn_support.sum() * dz, 1e-12)
+            # (1) Learned token support density in z
+            hist_learn_support, _ = np.histogram(z_learn, bins=z_edges)
+            dens_learn_support = hist_learn_support.astype(np.float64) / max(hist_learn_support.sum() * dz, 1e-12)
 
-        print("\n[z_learn support] mean/std density:",
-              float(dens_learn_support.mean()),
-              float(dens_learn_support.std()))
-        print("[z_learn support] min/max density :",
-              float(dens_learn_support.min()),
-              float(dens_learn_support.max()))
+            print("\n[z_learn support] mean/std density:",
+                  float(dens_learn_support.mean()),
+                  float(dens_learn_support.std()))
+            print("[z_learn support] min/max density :",
+                  float(dens_learn_support.min()),
+                  float(dens_learn_support.max()))
 
-        # (2) Stationary axial density measured with z_learn (no debias)
-        stat_hist_learn, _ = np.histogram(z_learn, bins=z_edges, weights=pi_np)
-        rho_stat_learn = stat_hist_learn.astype(np.float64) / max(stat_hist_learn.sum() * dz, 1e-12)
+            # (2) Stationary axial density measured with z_learn (no debias)
+            stat_hist_learn, _ = np.histogram(z_learn, bins=z_edges, weights=pi_np)
+            rho_stat_learn = stat_hist_learn.astype(np.float64) / max(stat_hist_learn.sum() * dz, 1e-12)
 
-        from source_code.analysis import p_z
-        a = float(W_true[1, 0].detach().cpu().item())
-        rho_theory = p_z(z_centers, a=a, beta=cfg.true_beta)
+            from source_code.analysis import p_z
+            a = float(W_true[1, 0].detach().cpu().item())
+            rho_theory = p_z(z_centers, a=a, beta=cfg.true_beta)
 
-        l1_learn_vs_theory = np.sum(np.abs(rho_stat_learn - rho_theory)) * dz
-        print("\n[learned emb ρ(z) (no debias)]")
-        print("  mean/std rho_stat_learn :", float(rho_stat_learn.mean()), float(rho_stat_learn.std()))
-        print("  L1(ρ_stat_learn, ρ_theory):", float(l1_learn_vs_theory))
+            l1_learn_vs_theory = np.sum(np.abs(rho_stat_learn - rho_theory)) * dz
+            print("\n[learned emb ρ(z) (no debias)]")
+            print("  mean/std rho_stat_learn :", float(rho_stat_learn.mean()), float(rho_stat_learn.std()))
+            print("  L1(ρ_stat_learn, ρ_theory):", float(l1_learn_vs_theory))
 
-        # (3) Debias learned stationary ρ(z) with learned token support
-        token_density_learn = dens_learn_support
-        token_density_learn_safe = np.maximum(token_density_learn, 1e-12)
+            # (3) Debias learned stationary ρ(z) with learned token support
+            token_density_learn = dens_learn_support
+            token_density_learn_safe = np.maximum(token_density_learn, 1e-12)
 
-        rho_stat_learn_debias = rho_stat_learn / token_density_learn_safe
-        rho_stat_learn_debias = rho_stat_learn_debias / max(np.sum(rho_stat_learn_debias) * dz, 1e-12)
+            rho_stat_learn_debias = rho_stat_learn / token_density_learn_safe
+            rho_stat_learn_debias = rho_stat_learn_debias / max(np.sum(rho_stat_learn_debias) * dz, 1e-12)
 
-        l1_learn_debias_vs_theory = np.sum(np.abs(rho_stat_learn_debias - rho_theory)) * dz
-        print("\n[learned emb ρ(z) debiased with learned support]")
-        print("  mean/std rho_stat_learn_debias :",
-              float(rho_stat_learn_debias.mean()),
-              float(rho_stat_learn_debias.std()))
-        print("  L1(ρ_stat_learn_debias, ρ_theory):", float(l1_learn_debias_vs_theory))
+            l1_learn_debias_vs_theory = np.sum(np.abs(rho_stat_learn_debias - rho_theory)) * dz
+            print("\n[learned emb ρ(z) debiased with learned support]")
+            print("  mean/std rho_stat_learn_debias :",
+                  float(rho_stat_learn_debias.mean()),
+                  float(rho_stat_learn_debias.std()))
+            print("  L1(ρ_stat_learn_debias, ρ_theory):", float(l1_learn_debias_vs_theory))
 
     # Use transformed snapshots if available
     snaps_for_dashboard = snaps_tilde if (snaps_tilde is not None) else snaps
@@ -451,9 +497,9 @@ def main(cfg: RunConfig = RunConfig()):
     # Rollout uses transform if available
     if cfg.save_rollout_animation:
         B_rollout_display = 5
-        B_density = 800
-        rollout_temperature = 1.0
-        rollout_steps =500
+        B_density = 200
+        rollout_temperature = 0.1
+        rollout_steps = 200
 
         assert B_density >= B_rollout_display, "B_density must be >= B_rollout_display"
 
@@ -655,22 +701,59 @@ def main(cfg: RunConfig = RunConfig()):
               float(rho_stat_model_debias.std()))
         print("  L1(ρ_stat_model_debias, ρ_theory):", float(l1_model_debias_vs_theory))
 
+    # --- Inspect learned positional matrix Mp and positional vectors p_t ---
+    with torch.no_grad():
+        # recovered / scaled-out positional metric from rec
+        try:
+            Mp_tilde = np.asarray(rec["M_tilde"])
+            print("\n[M_tilde] recovered positional metric (canonical gauge):")
+            print(np.round(Mp_tilde, 3))
+        except Exception:
+            pass
+
+        # raw model Mp
+        Mp = model.Mp.detach().cpu().numpy()
+        print("\n[Mp] learned positional matrix (raw model basis):")
+        print(np.round(Mp, 3))
+
+        # ptilde (positional vectors in canonical gauge, from analysis)
+        try:
+            ptilde = np.asarray(rec["ptilde"])
+            print("\n[ptilde] positional vectors (canonical gauge):")
+            print("  shape:", ptilde.shape)
+            print("  ptilde_t (all rows):\n", np.round(ptilde, 3))
+
+            t_idx = np.arange(ptilde.shape[0])
+            for d in range(ptilde.shape[1]):
+                corr = np.corrcoef(t_idx, ptilde[:, d])[0, 1]
+                print(f"  corr(t, ptilde[:,{d}]): {corr:.3f}")
+        except Exception:
+            pass
+
+        # Positional vectors from the model (raw basis)
+        try:
+            Ppos = model.Ppos.detach().cpu().numpy()
+            print("\n[Ppos] positional vectors (raw model basis):")
+            print("  shape:", Ppos.shape)
+            print("  p_t (all rows):\n", np.round(Ppos, 3))
+
+            t_idx = np.arange(Ppos.shape[0])
+            for d in range(Ppos.shape[1]):
+                corr = np.corrcoef(t_idx, Ppos[:, d])[0, 1]
+                print(f"  corr(t, Ppos[:,{d}]): {corr:.3f}")
+        except AttributeError:
+            print("\n[Ppos] model has no Ppos (old checkpoint or different config).")
+
     assert cfg.W_true.shape == (cfg.dE, cfg.dE), f"W_true must be ({cfg.dE},{cfg.dE})"
 
 
 if __name__ == "__main__":
     main(
         RunConfig(
-            generate_new_data=True,
-            train_new_run=True,
-            save_training_animation=True,
-            save_rollout_animation=True,
-            save_embedding_animation=True,
+            generate_new_data=False,
+            train_new_run=False,
+            save_training_animation=False,
+            save_rollout_animation=False,
+            save_embedding_animation=False,
         )
     )
-# I'd like to make another gen_data method where our transition probability is given by:
-
-# P(E^{t+1} | m^{t}) ~ exp(m^{t} W E^{t+1}) 
-
-# m^{t+1} = (1-mu ) m^{t} + mu E^{t}
-
