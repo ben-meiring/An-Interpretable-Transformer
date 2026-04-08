@@ -64,7 +64,8 @@ class PosAttn_TokenOut(nn.Module):
 
         self.W = nn.Parameter(0.01 * torch.randn(5, 5, dtype=torch.get_default_dtype()))
 
-        mask = torch.tril(torch.ones(self.L_pos, self.L_pos, dtype=torch.bool), diagonal=-1)
+        # allow each position to see itself and all previous positions (j <= i)
+        mask = torch.tril(torch.ones(self.L_pos, self.L_pos, dtype=torch.bool), diagonal=0)
         self.register_buffer("causal_mask", mask)
 
     # --- Convenience properties ---
@@ -84,7 +85,8 @@ class PosAttn_TokenOut(nn.Module):
     @property
     def Mp(self) -> torch.Tensor:
         if not self.use_identity_Mp:
-            return self.M[-2:, -2:]
+            # OLD: return self.M[-2:, -2:]
+            return self.M[:2, :2]   # Mp lives on the first 2 dims (positions)
         I = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=self.M.dtype, device=self.M.device)
         return I  # keep current behavior
 
@@ -105,26 +107,30 @@ class PosAttn_TokenOut(nn.Module):
             scores = scores.masked_fill(~causal[:L, :L], float("-inf"))
             alpha = torch.softmax(scores, dim=-1)
             alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
-            alpha[0, :] = 0.0
             return alpha.unsqueeze(0).expand(B, L, L)
 
         M_block = torch.zeros(5, 5, dtype=s.dtype, device=s.device)
-        M_block[-2:, -2:] = self.Mp
+        # OLD: M_block[-2:, -2:] = self.Mp
+        M_block[:2, :2] = self.Mp             # positions are first 2 dims in s
         sM = torch.einsum("bld,dk->blk", s, M_block)
         scores = torch.einsum("bld,bmd->blm", sM, s)
         scores = self.beta_attn * scores
         scores = scores.masked_fill(~causal[:L, :L].unsqueeze(0), float("-inf"))
         alpha = torch.softmax(scores, dim=-1)
         alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
-        alpha[:, 0, :] = 0.0
         return alpha
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         Epart, Ppart = self._parts(x)
-        s = torch.cat([Epart, Ppart], dim=-1)
+        # OLD: s = torch.cat([Epart, Ppart], dim=-1)
+        s = torch.cat([Ppart, Epart], dim=-1)   # (B, L, 2 + dE)
+
         alpha = self.attn_weights(s)
         c_s = torch.einsum("bij,bjd->bid", alpha, s)
-        c_E = c_s[..., : self.dE]
+
+        # embeddings are now the LAST dE dims, not the first
+        c_E = c_s[..., -self.dE:]              # (B, L, dE)
+
         h_E = torch.einsum("bij,jk->bik", c_E, self.WE)
         logits_full = self.beta_class * (h_E @ self.E.weight.t())
         return logits_full
@@ -168,15 +174,20 @@ class TrainSnapshots:
 
 
 def _full_ce_loss(model: PosAttn_TokenOut, seqs: torch.Tensor) -> float:
-    """Full-dataset next-token CE (no L2), computed in one pass."""
+    """Full-dataset next-token CE (no L2), with teacher forcing.
+
+    Input tokens:  x_0,...,x_{L-2}
+    Targets:       x_1,...,x_{L-1}
+    At position i (0-based) the model sees tokens up to x_i and predicts x_{i+1}.
+    """
     V = model.V
-    x_input = seqs[:, :-1]
-    targets = seqs[:, :-1]
-    logits = model(x_input)
+    x_input = seqs[:, :-1]   # (B, L-1): x_0..x_{L-2}
+    targets = seqs[:, 1:]    # (B, L-1): x_1..x_{L-1}
+    logits = model(x_input)  # (B, L-1, V)
     return float(
         F.cross_entropy(
-            logits[:, 1:, :].reshape(-1, V),
-            targets[:, 1:].reshape(-1),
+            logits.reshape(-1, V),
+            targets.reshape(-1),
         ).item()
     )
 
@@ -228,14 +239,15 @@ def train_model(
             idx = perm[i : i + config.batch_size]
             x = train_seqs[idx]  # (B, seq_len)
 
-            x_input = x[:, :-1]      # (B, L-1)
-            targets = x[:, :-1]      # same as original setup
+            x_input = x[:, :-1]      # (B, L-1): x_0..x_{L-2}
+            targets = x[:, 1:]       # (B, L-1): x_1..x_{L-1}
 
             logits = model(x_input)  # (B, L-1, V)
 
+            # Teacher forcing: at position i, context sees x_0..x_i and predicts x_{i+1}
             ce_loss = F.cross_entropy(
-                logits[:, 1:, :].reshape(-1, V),
-                targets[:, 1:].reshape(-1),
+                logits.reshape(-1, V),
+                targets.reshape(-1),
             )
 
             loss = ce_loss
@@ -253,9 +265,9 @@ def train_model(
             # snapshots (store CPU numpy)
             if (batch_counter % batches_per_snapshot) == 0:
                 with torch.no_grad():
-                    # alpha snapshot uses a single batch (fine for viz)
                     Epart, Ppart = model._parts(x_input)
-                    s = torch.cat([Epart, Ppart], dim=-1)
+                    # FIX: match model.forward: s = [Ppart, Epart]
+                    s = torch.cat([Ppart, Epart], dim=-1)
                     alpha0 = model.attn_weights(s)[0]
 
                     snaps.pos_snapshots.append(model.Ppos.detach().cpu().numpy().copy())
@@ -334,13 +346,29 @@ def train_model(
     
     T_E = rec["A"] @ rec["U"]  # numpy (dE,dE)
 
-    # Transform ONLY the embedding snapshots; keep everything else identical
-    # snaps.E_snapshots is a list of numpy arrays (V,dE) in your current dashboard code.
+    # Transform snapshots into canonical gauge
     snaps_tilde = copy.copy(snaps)
+
+    # --- 1) Token embeddings: E_tilde = E @ T_E ---
     E_snapshots_tilde = []
-    for E in snaps.E_snapshots:
+    for E in snaps.E_snapshots:          # each E is numpy (V, dE)
         E_snapshots_tilde.append(E @ T_E)
     snaps_tilde.E_snapshots = E_snapshots_tilde
+
+    # --- 2) Positional vectors: q_j = (1/scale_p) * R_pos^T (p_j - pL) ---
+    R_pos = rec.get("R_pos", None)       # numpy (d_pos, 2)
+    pL = rec.get("pL", None)             # numpy (d_pos,)
+    scale_p = rec.get("scale_p", None)   # <-- use scale_p, not scale_q
+
+    if R_pos is not None and pL is not None and scale_p is not None:
+        pos_snapshots_tilde = []
+        for P in snaps.pos_snapshots:    # each P: (L_pos, d_pos)
+            P_shift = P - pL             # broadcast subtract
+            q = (P_shift @ R_pos) / max(scale_p, 1e-12)  # (L_pos, 2)
+            pos_snapshots_tilde.append(q)
+        snaps_tilde.pos_snapshots = pos_snapshots_tilde
+    else:
+        snaps_tilde.pos_snapshots = snaps.pos_snapshots
 
     # store in meta too (optional)
     meta = dict(meta)

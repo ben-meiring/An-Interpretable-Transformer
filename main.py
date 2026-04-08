@@ -60,9 +60,9 @@ class RunConfig:
     dataset_name: str = "dataset_latest.pt"
 
     # experiment
-    V: int = 500  # tokens
+    V: int = 100  # tokens
     dE: int = 3
-    n_seqs: int = 50 * (1000)
+    n_seqs: int = 20 * (1000)
     seq_len: int = 20
     true_beta: float = 5.0
 
@@ -84,10 +84,10 @@ class RunConfig:
     )          # () -> sample randomly
 
     # training
-    n_epochs: int = 800
+    n_epochs: int = 100
     lr: float = 3e-3
     batch_size: int = 100
-    epochs_per_frame: float = 0.4
+    epochs_per_frame: float = 5 #0.4
     l2_lambda: float = 0 * 1e-5
     log_every_epochs: int = 50
 
@@ -357,7 +357,7 @@ def main(cfg: RunConfig = RunConfig()):
             V=cfg.V,
             L=cfg.seq_len,
             dE=cfg.dE,
-            use_batch_invariant_alpha=True,
+            use_batch_invariant_alpha=False,
             use_identity_Mp=False,
         )
         
@@ -730,6 +730,14 @@ def main(cfg: RunConfig = RunConfig()):
         except Exception:
             pass
 
+        # final query vector q_L in canonical gauge (if available)
+        try:
+            q_L = np.asarray(rec["q_L"])
+            print("\n[q_L] final query vector (canonical gauge):")
+            print("  q_L:", np.round(q_L, 4))
+        except Exception:
+            pass
+
         # Positional vectors from the model (raw basis)
         try:
             Ppos = model.Ppos.detach().cpu().numpy()
@@ -750,9 +758,9 @@ def main(cfg: RunConfig = RunConfig()):
 if __name__ == "__main__":
     main(
         RunConfig(
-            generate_new_data=False,
-            train_new_run=False,
-            save_training_animation=False,
+            generate_new_data=True,
+            train_new_run=True,
+            save_training_animation=True,
             save_rollout_animation=False,
             save_embedding_animation=False,
         )

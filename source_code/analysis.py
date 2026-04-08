@@ -139,36 +139,88 @@ def whiten_embeddings_and_recover_W(
     # Position vector analysis
     P = P_hat.detach()
     M = M_hat.detach()
+    L_pos, d_pos = P.shape
+    # 1) Centered design matrix X = p_j - p_bar
+    P_bar = P.mean(dim=0)      # (1, d_pos)
+    X = P - P_bar
 
-    # SM_emp = attention score
-    SM_emp = beta_attn_hat * (P @ M @ P.t())
-    SM_tilde = SM_emp - SM_emp.mean(dim=1, keepdim=True)
+    # 2) SVD: X = U S V^T  ⇒ columns of V are orthonormal directions
+    #    e2 = direction of largest variance, e1 = next one.
+    U_x, S_x, Vh_x = torch.linalg.svd(X, full_matrices=False)
+    V_x = Vh_x.t()                           # (d_pos, d_pos)
+    e2 = V_x[:, 0]                           # dominant direction
+    e1 = V_x[:, 1]                           # secondary direction
 
-    P_centered = P - P.mean(dim=0, keepdim=True)
+    # 3) Fix sign so e2^T (p_0 - p_L) > 0
+    #p0 = P[0]                                # (d_pos,)
+    pL = P[-1]                               # (d_pos,)
+    diff = P_bar - pL
+    if torch.dot(e2, diff) < 0:
+        e2 = -e2
 
-    P_pinv = torch.linalg.pinv(P)
-    P_centered_pinv = torch.linalg.pinv(P_centered)
+    # 4) Build R = [e1 e2], and define scale_q, scale_p
+    #    R has shape (d_pos, 2); columns are orthonormal.
+    R = torch.stack([e1, e2], dim=1)        # (d_pos, 2)
 
-    M_rec = P_pinv @ SM_tilde @ P_centered_pinv.t()
-    M_sym = 0.5 * (M_rec + M_rec.t())
-    M_skew = 0.5 * (M_rec - M_rec.t())
+    scale_p = torch.dot(e2, diff).clamp_min(1e-12)   # > 0 by construction
+    scale_q = torch.dot(pL, e2)
 
-    evals_M, U_M = torch.linalg.eigh(M_sym)
-    D_M = torch.diag(evals_M)
+    # 5) New coordinates: q_j = (1/scale_q) * R^T (p_j - p_L)
+    #    Implemented as (P - pL) @ R, which gives rows q_j^T.
+    p_shift = P - pL.unsqueeze(0)           # (L_pos, d_pos)
+    ptilde = (p_shift @ R) / scale_p
 
-    sqrt_abs_D_M = torch.diag(torch.sqrt(torch.abs(evals_M)))
-    sign_diag_M = torch.sign(evals_M)
-    Sign_M = torch.diag(sign_diag_M)
+    # 6) New metric: M_rec = scale_p * scale_q * R^T M R  (2x2)
+    M_tilde = scale_p * scale_q * (R.t() @ M @ R)     # (2, 2)
+    # queries:
+    q = (P @ R) / scale_p                           # (L_pos, 2)
+    q_L = q[-1]   
 
-    T_pos_raw = U_M @ sqrt_abs_D_M
-    T_pos_pinv = torch.linalg.pinv(T_pos_raw)
-    M_tilde = T_pos_pinv @ M_rec @ T_pos_pinv.t()
+    # Symmetric / skew parts of the 2x2 metric, for diagnostics
+    # M_sym = 0.5 * (M_tilde + M_tilde.t())
+    # M_skew = 0.5 * (M_tilde - M_tilde.t())
 
-    ptilde = P_centered @ T_pos_raw
-
+    # Optional diagnostics (do NOT rescale ptilde further)
     ptilde_quad = torch.einsum("bi,ij,bj->b", ptilde, M_tilde, ptilde)
+    ptilde_M_mean = torch.sqrt(torch.abs(ptilde_quad)).mean().clamp_min(1e-12)
     ptilde_norm_mean = torch.linalg.norm(ptilde, dim=1).mean().clamp_min(1e-12)
-    ptilde = ptilde / ptilde_norm_mean
+    
+    
+    
+    ## original approach
+    # # SM_emp = attention score
+    # SM_emp = beta_attn_hat * (P @ M @ P.t())
+    # SM_tilde = SM_emp - SM_emp.mean(dim=1, keepdim=True)
+
+    # P_centered = P - P.mean(dim=0, keepdim=True)
+
+    # P_pinv = torch.linalg.pinv(P)
+    # P_centered_pinv = torch.linalg.pinv(P_centered)
+
+    # M_rec = P_pinv @ SM_tilde @ P_centered_pinv.t()
+    # M_sym = 0.5 * (M_rec + M_rec.t())
+    # M_skew = 0.5 * (M_rec - M_rec.t())
+
+    # evals_M, U_M = torch.linalg.eigh(M_sym)
+    # D_M = torch.diag(evals_M)
+
+    # sqrt_abs_D_M = torch.diag(torch.sqrt(torch.abs(evals_M)))
+    # sign_diag_M = torch.sign(evals_M)
+    # Sign_M = torch.diag(sign_diag_M)
+
+    # T_pos_raw = U_M # @ sqrt_abs_D_M
+    # T_pos_pinv = torch.linalg.pinv(T_pos_raw)
+    # M_tilde = T_pos_pinv @ M_rec @ T_pos_pinv.t()
+    # ptilde = P @ T_pos_raw
+    ## end of section
+
+    ## just uses the whitening anyway
+    # M_tilde = M_rec
+    # ptilde = P
+
+    # ptilde_quad = torch.einsum("bi,ij,bj->b", ptilde, M_tilde, ptilde)
+    # ptilde_norm_mean = torch.linalg.norm(ptilde, dim=1).mean().clamp_min(1e-12)
+    # ptilde = ptilde / ptilde_norm_mean
     #tau_pos_rescaled = float(tau_hat * (float(ptilde_norm_mean.item()) ** 2)) #SUSPICIOUS
 
     ## recalculates so that it now should be 1.
@@ -189,16 +241,17 @@ def whiten_embeddings_and_recover_W(
         ptilde=ptilde.detach().cpu().numpy(),
         T_E=T_E.detach().cpu().numpy(),
         Wtilde=Wtilde_np,
-        M_sym=M_sym.detach().cpu().numpy(),
-        M_skew=M_skew.detach().cpu().numpy(),
-        U_M=U_M.detach().cpu().numpy(),
-        D_M=D_M.detach().cpu().numpy(),
-        T_pos_raw=T_pos_raw.detach().cpu().numpy(),
-        Sign_M=Sign_M.detach().cpu().numpy(),
+        # M_sym=M_sym.detach().cpu().numpy(),
+        # M_skew=M_skew.detach().cpu().numpy(),
         M_tilde=M_tilde.detach().cpu().numpy(),
         ptilde_norm_mean=float(ptilde_norm_mean.item()),
         ptilde_M_mean=float(ptilde_M_mean.item()),
-        #tau_pos_rescaled=tau_pos_rescaled,
+        # --- positional gauge parameters for transforming snapshots ---
+        R_pos=R.detach().cpu().numpy(),          # (d_pos, 2)
+        pL=pL.detach().cpu().numpy(),            # (d_pos,)
+        scale_q=float(scale_q.item()),
+        scale_p=float(scale_p.item()),
+        q_L=q_L.detach().cpu().numpy(),
     )
     return out
 
