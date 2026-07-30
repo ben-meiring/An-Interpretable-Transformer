@@ -4,6 +4,10 @@ This project studies a small autoregressive transformer trained on a controlled 
 
 I trained a simple transformer to predict Markov chains on the surface of a 3D sphere. Because the underlying data-generating process is known, this provides a toy setting where we can ask whether the transformer’s learned weights and embeddings can be understood analytically.
 
+<p align="center">
+  <img src="markov_training.gif" width="600" alt="Markov model training animation">
+</p>
+
 ## Motivation
 
 Transformers are difficult to interpret because their learned representations are high-dimensional and highly redundant. My goal was to build a small transformer in a setting where the underlying dynamics were simple enough to understand, then analyze whether the model’s parameters could be interpreted geometrically or dynamically.
