@@ -90,7 +90,7 @@ The matrix $M$ determines which previous states are attended to, while $W$ maps 
 
 <br>
 <p align="center">
-  <img src="autoregression.gif" width="500" alt="Transformer autoregression in embedding space">
+  <img src="autoregression.gif" width="700" alt="Transformer autoregression in embedding space">
 </p>
 
 <p align="center">
