@@ -88,6 +88,15 @@ e(x_j)^TWh_t.
 
 The matrix $M$ determines which previous states are attended to, while $W$ maps the resulting hidden state into the token-embedding space used for next-token prediction.
 
+<br>
+<p align="center">
+  <img src="autoregression.gif" width="500" alt="Transformer autoregression in embedding space">
+</p>
+
+<p align="center">
+  <em>The transformer performs autoregressive generation in the learned spherical embedding space.</em>
+</p>
+
 ## Gauge fixing and interpretation
 
 The learned embeddings and weight matrices are not unique: invertible changes of coordinates can alter their numerical values without changing the model's predictions. To compare the trained model with the known data-generating process, we center and whiten the embeddings and transform the learned weights into a canonical coordinate system.
