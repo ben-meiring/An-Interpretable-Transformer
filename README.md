@@ -10,7 +10,7 @@ We find that:
 
 <br>
 <p align="center">
-  <img src="markov_training.gif" width="400" alt="Learned token embeddings evolving during training">
+  <img src="markov_training.gif" width="500" alt="Learned token embeddings evolving during training">
 </p>
 
 <p align="center">
