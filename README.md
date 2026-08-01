@@ -129,19 +129,19 @@ When the transition distribution is sharply concentrated, the most probable traj
 \large
 x_{n+1}
 =
-\frac{Wx_n+F}{\left\lVert Wx_n+F\right\rVert}
+\frac{W_E x_n+F}{\left\lVert W_E x_n+F\right\rVert}
 \qquad
 \Longrightarrow
 \qquad
 \dot{x}
 =
-\frac{Wx+F}{\left\lVert Wx+F\right\rVert}
+\frac{W_E x+F}{\left\lVert W_E x+F\right\rVert}
 -x.
 ```
 
 <br>
 
-The learned interaction matrix and effective force therefore determine trajectories through the embedding space. For the special case $G=I$, $K\mathbf{x}=a\,\hat{\mathbf{z}}\times\mathbf{x}$, and $\mathbf{F}=h\hat{\mathbf{z}}$, the late-time trajectory approaches the stable latitude 
+The learned interaction matrix and effective force therefore determine trajectories through the embedding space. For the special case $G=I$, $K=a(\hat{\mathbf y}\otimes\hat{\mathbf x}-\hat{\mathbf x}\otimes\hat{\mathbf y})$, and $\mathbf F=h\hat{\mathbf z}$, the late-time trajectory approaches the stable latitude
 
 ```math
 \large
@@ -154,16 +154,17 @@ z_*
 
 <br>
 
-This stable trajectory can be seen in the autoregression evolution below:
+Convergence to this stable trajectory can be seen in the autoregression evolution below:
 
 <br>
 
 <p align="center">
-  <img src="autoregression.gif" width="800" alt="Transformer autoregression in embedding space">
+  <img src="autoregression.gif" width="900" alt="Transformer autoregression in embedding space">
 </p>
 
 <p align="center">
-  <em>The left panel shows the transformer generating an autoregressive trajectory through the learned embedding space. The right panels compare the accumulated token distribution with the analytic late-time distribution, resolved along the axial coordinate z (top) and azimuthal coordinate φ (bottom).</em>
+  <strong>Left:</strong> Autoregressive trajectory through the learned embedding space.<br>
+  <strong>Right:</strong> Accumulated token distribution compared with the analytic late-time distribution for z (top) and φ (bottom).
 </p>
 
 <br>
