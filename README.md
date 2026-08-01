@@ -92,7 +92,17 @@ e(x_j)^TWh_t.
 
 <br>
 
-The matrix $M$ determines which previous states are attended to, while $W$ maps the resulting hidden state into the token-embedding space used for next-token prediction.
+The matrix $M$ determines which previous states are attended to, while $W$ maps the resulting hidden state into the token-embedding space. Taking its inner product with each candidate embedding produces the logits, which define the next-token distribution through a softmax,
+
+```math
+\large
+P_\theta(x_{t+1}=x_j\mid x_{\leq t})
+=
+\frac{\exp(\ell_{t,j})}
+{\displaystyle\sum_k\exp(\ell_{t,k})}.
+```
+
+<br>
 
 ## Gauge fixing and interpretation
 
