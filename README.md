@@ -193,6 +193,11 @@ The autoregressive evolution below shows convergence toward this stable trajecto
 
 <br>
 
+## Discussion
+
+We have shown that the transformer's behaviour can be predicted using a dynamical-systems analysis. Its learned embedding space admits a simple geometric description, and autoregression can be interpreted as evolution through this space.
+
+Future directions include extending the analysis to higher-dimensional, more complex datasets and investigating how non-trivial context modifies this picture.
 
 ## Running
 
